@@ -1,0 +1,86 @@
+#!/bin/bash
+#PBS -N cola_frozen_pi05
+#PBS -l select=1:ngpus=1:mem=110gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /home/users/ntu/ahaskar0/CoLA/logs/
+#PBS -P personal
+
+# CoLA on a FROZEN pi0.5, hidden-marker handover (tray task).
+#
+# Tests the backbone-agnostic claim: pi0.5 is frozen and only CoLA's adapters,
+# message channel and UNet head train -- the same ~15.2M parameters, the same
+# trainer, the same 150-epoch budget and the same scoring as CoLA's own
+# run_marker_wristmsg (73.9% correct-tray on Octo-Base features).
+#
+#   qsub -v MODE=extract                        cola_frozen_pi05.pbs
+#   qsub -v MODE=train,TAG=wristmsg             cola_frozen_pi05.pbs
+#   qsub -v MODE=train,TAG=wristnomsg           cola_frozen_pi05.pbs   # L0 control
+#   qsub -v MODE=eval_shard,TAG=wristmsg,OFFSET=0,EPISODES=50  cola_frozen_pi05.pbs
+#   qsub -v MODE=merge,TAG=wristmsg             cola_frozen_pi05.pbs
+
+set -uo pipefail
+MODE=${MODE:-extract}
+TAG=${TAG:-wristmsg}
+HERE=/home/users/ntu/ahaskar0/CoLA/training/handover_2arm_marker_pi05/frozen
+RUNS=/scratch/users/ntu/ahaskar0/cola_pi05_frozen_runs
+OUT=/home/users/ntu/ahaskar0/CoLA/experiments/cola_pi05_frozen
+CACHE=/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_marker_v1
+FEATS=/scratch/users/ntu/ahaskar0/pi05_marker_features
+
+export OPENPI_DATA_HOME=/scratch/users/ntu/ahaskar0/openpi_cache
+export XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_MEM:-0.92}
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 WANDB_MODE=disabled
+export TOKENIZERS_PARALLELISM=false
+export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+PY=/scratch/users/ntu/ahaskar0/venv-openpi/bin/python
+EVAL_SITE=/scratch/users/ntu/ahaskar0/pi05_eval_site   # MuJoCo 3.12.0, CoLA's eval version
+
+mkdir -p /home/users/ntu/ahaskar0/CoLA/logs "$RUNS" "$OUT"
+cd "$HERE"
+echo "Job started: $(date) | node $(hostname) | mode $MODE | tag $TAG"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+FAILED=0
+case "$MODE" in
+extract)
+    $PY extract_pi05_features.py --feat-dir "$FEATS" --action-cache "$CACHE" || FAILED=1
+    ;;
+train)
+    # Flags copied from scripts/train_marker_wristmsg.pbs: wrist cameras only
+    # (no --overhead), CoLA's gripper weighting, diffusion U-Net head, 150 epochs.
+    MSG=""; [ "$TAG" = wristnomsg ] && MSG="--no_messages"
+    $PY train_cola_frozen_pi05.py \
+        --cache_dir "$CACHE" --feat_dir "$FEATS" --run_dir "$RUNS/$TAG" \
+        --lambda_gripper 0.25 --grip_transition_weight 0 \
+        --diffusion --diffusion_unet --num_epochs 150 $MSG || FAILED=1
+    $PY - "$RUNS/$TAG" "$TAG" <<'PYEOF' || FAILED=1
+import pickle, sys
+c = pickle.load(open(f'{sys.argv[1]}/checkpoints/best_model.pkl', 'rb'))
+msg, ovh = c.get('use_messages'), c.get('use_overhead')
+print(f'checkpoint use_messages={msg} use_overhead={ovh} epoch={c.get("epoch")} val={c.get("val_loss"):.6f}')
+if sys.argv[2] == 'wristmsg' and msg is False:
+    sys.exit('ABORT: messages severed in a run that should have them ON')
+if sys.argv[2] == 'wristnomsg' and msg is not False:
+    sys.exit('ABORT: control run has messages ON')
+if ovh:
+    sys.exit('ABORT: overhead is ON; the marker runs are wrist-only')
+print('condition confirmed')
+PYEOF
+    ;;
+eval_shard)
+    PYTHONPATH=$EVAL_SITE $PY eval_cola_frozen_pi05_marker.py \
+        --model "$RUNS/$TAG/checkpoints/best_model.pkl" --cache-dir "$CACHE" \
+        --episodes ${EPISODES:-50} --seed-offset ${OFFSET:-0} --max-control-steps 400 \
+        --results-path "$OUT/$TAG/results_shard${OFFSET:-0}.json" \
+        --video-dir "$OUT/$TAG/videos/shard${OFFSET:-0}" || FAILED=1
+    ;;
+merge)
+    PYTHONPATH=$EVAL_SITE $PY eval_cola_frozen_pi05_marker.py --merge "$OUT/$TAG"/results_shard*.json \
+        --results-path "$OUT/$TAG/results.json" || FAILED=1
+    ;;
+*) echo "unknown MODE $MODE (extract, train, eval_shard, merge)"; exit 1 ;;
+esac
+
+echo "Job finished: $(date) | failed=$FAILED"
+exit $FAILED

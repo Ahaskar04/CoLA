@@ -1,0 +1,107 @@
+# COLA Dependencies
+# Install with: pip install -r requirements.txt
+#
+# NOTE (Linux/NSCC): tensorflow-macos is Apple-Silicon-only and has been
+# removed -- plain tensorflow==2.15.0 below is the correct package here.
+#
+# NOTE (CUDA): probed on a compute node (scripts/probe_gpu.pbs, 2026-08-13):
+#   GPU    NVIDIA A100-SXM4-40GB
+#   Driver 570.124.06  ->  supports CUDA up to 12.8
+# torch 2.13.0 was rejected: it bundles CUDA 13.0.3, one major version above
+# the driver ceiling, so it would import fine and then fail at .cuda().
+# Pinned to torch 2.5.1 + cu121 instead -- same CUDA 12.x family the previous
+# JAX pipeline ran on successfully on this cluster, and numpy-1.x compatible
+# so JAX and torch can share one env.
+# The cu121 wheels come from PyTorch's own index, not PyPI:
+#   pip install torch==2.5.1 torchvision==0.20.1 \
+#       --index-url https://download.pytorch.org/whl/cu121
+#
+# NOTE (numpy): jaxlib==0.4.20 is built against the numpy 1.x ABI, so
+# numpy==1.24.3 must be installed LAST -- tensorflow/transformers will
+# silently upgrade it otherwise. Symptom of the conflict:
+#   AttributeError: _ARRAY_API not found
+# If torch 2.13 turns out to require numpy>=2, JAX and torch cannot share
+# one env; split into a one-off conversion env (jax/flax/orbax/tf) and a
+# training env (torch only). See octo-pytorch/octo_pt_setup.md.
+
+# Core ML frameworks
+# NOTE: install these two from the cu121 index (see CUDA note above), not PyPI.
+torch==2.5.1
+torchvision==0.20.1
+tensorflow==2.15.0
+tensorflow-probability==0.23.0
+
+# JAX ecosystem (for Octo model loading -- CPU build is sufficient, the
+# JAX->PyTorch weight conversion does not need a GPU)
+jax==0.4.20
+jaxlib==0.4.20
+flax==0.7.5
+optax==0.1.5
+chex==0.1.85
+orbax-checkpoint==0.4.4
+
+# HuggingFace
+transformers==4.34.1
+tokenizers==0.14.1
+huggingface-hub==0.17.3
+safetensors==0.8.0
+# accelerate==1.14.0 removed: requires huggingface-hub>=0.21, which conflicts
+# with tokenizers 0.14.1 (caps hub at <0.18). Nothing here imports accelerate.
+
+# Data handling
+h5py==3.14.0
+scipy==1.12.0
+
+# Visualization
+matplotlib==3.10.9
+pillow==12.3.0
+# Video writing for demo collection and policy rollouts. mediapy shells out to
+# an `ffmpeg` binary on PATH; the cluster has no system ffmpeg, so imageio-ffmpeg
+# supplies a bundled static build (see scripts/rollout.pbs for the PATH setup).
+mediapy
+imageio-ffmpeg
+
+# Utilities
+einops==0.8.2
+tqdm==4.68.4
+PyYAML==6.0.3
+click==8.4.2
+rich==15.0.0
+
+# ML utilities
+ml_collections==1.1.0
+dm-tree==0.1.10
+distrax==0.1.5
+tensorstore==0.1.45
+
+# TensorBoard
+tensorboard==2.15.2
+
+# Experiment tracking
+wandb
+
+# Networking
+requests==2.34.2
+httpx==0.28.1
+fsspec==2026.6.0
+
+# Other
+absl-py==2.5.0
+cloudpickle==3.1.2
+nest-asyncio==1.6.0
+packaging==26.0
+psutil==7.2.2
+regex==2026.7.10
+sympy==1.14.0
+typer==0.27.0
+
+# MuJoCo (simulation environment + data collection)
+mujoco
+# Inverse kinematics for the scripted demo policy and for policy rollouts.
+# mink solves the IK as a QP; daqp is the solver backend utils.py selects.
+mink
+loop_rate_limiters
+qpsolvers[daqp]
+
+# Install LAST -- see numpy note above
+numpy==1.24.3
