@@ -1,36 +1,14 @@
-"""CoLA on a pi0.5 backbone: two decentralised pi0.5 policies joined by a 64-d
-learned message channel, finetuned end to end.
+"""CoLA on a LoRA-finetuned pi0.5 backbone (two arms, 64-d message channel).
 
-This is CoLA's structure (training/handover_2arm and the Octo-based
-cola_architecture.py) with the backbone swapped, nothing else:
+Same structure as the Octo-based model: each arm's encoder turns its pooled
+PaliGemma prefix (2048-d masked mean) into a message, and the partner's
+decoder adds it to pi0.5's action-expert conditioning (the adaRMS input,
+alongside the flow-matching time). The decoder's last layer is
+zero-initialised, so training starts from pretrained pi0.5.
 
-    CoLA / Octo-Base (frozen)                CoLA / pi0.5 (LoRA-finetuned)
-    -------------------------                ------------------------------------
-    own wrist image -> Octo readout 768-d    own wrist image + prompt + state
-                                             -> PaliGemma prefix, masked mean 2048-d
-    MessageEncoder  768 -> 96 -> 64          MessageEncoder 2048 -> 96 -> 64
-    MessageDecoder  64 -> 96 -> 768          MessageDecoder 64 -> 96 -> 1024
-    UNet head, FiLM on [self | decoded]      pi0.5 action expert, adaRMS on
-                                             [flow time embedding + decoded]
-
-One encoder and one decoder per arm, exactly as CoLA: A's encoder writes A's
-message, B's decoder reads it (and vice versa). pi0.5's own action expert is
-the action head. Its global conditioning vector -- the adaRMS input that
-pi0.5 already uses for the flow-matching time -- is where the decoded partner
-message enters, the analogue of CoLA's U-Net, whose FiLM conditioning is the
-concatenation of the arm's own features and the decoded partner message.
-
-The decoder's last layer is zero-initialised, so at step 0 the model is
-exactly pretrained pi0.5 and the channel has to earn its influence.
-
-The two arms share pi0.5's weights and are told apart by their prompt; each
-arm still sees only its own wrist camera and its own joint state, and the 64-d
-message is the only thing that crosses between them. Messages flow from the
-PaliGemma prefix into the partner's action expert, so the prefix is run first
-(filling pi0.5's KV cache, as its own sampler does) and the suffix second --
-the same compute as pi0.5's single joint pass, split in two.
-
-Nothing in openpi is modified; this subclasses openpi's Pi0.
+Both arms share pi0.5's weights and differ only in their prompt; each sees
+only its own wrist camera and joint state. The prefix runs first (filling the
+KV cache), then the suffix. Subclasses openpi's Pi0; openpi is not modified.
 """
 
 import dataclasses
@@ -46,9 +24,8 @@ from openpi.models import pi0 as _pi0
 from openpi.models import pi0_config as _pi0_config
 import openpi.models.gemma as _gemma
 
-# One image slot per arm: that arm's own wrist camera. The name only has to
-# contain "wrist" (openpi skips crop/rotate augmentation for wrist views);
-# pi0.5 has no per-slot embedding, so the slot name carries no meaning.
+# One image slot per arm: its own wrist camera. "wrist" in the name makes
+# openpi skip crop/rotate augmentation.
 IMAGE_KEY = "wrist_0_rgb"
 MESSAGE_DIM = 64      # CoLA's MESSAGE_DIM
 MESSAGE_HIDDEN = 96   # CoLA's encoder/decoder hidden width
@@ -68,8 +45,7 @@ class MessageEncoder(nnx.Module):
 class MessageDecoder(nnx.Module):
     """Partner's 64-d message -> action-expert conditioning. CoLA's MessageDecoder.
 
-    Output layer zero-initialised: pretrained pi0.5 is recovered exactly at
-    initialisation, and gradients still reach the encoder after the first step.
+    The output layer is zero-initialised, so training starts from pretrained pi0.5.
     """
 
     def __init__(self, out_dim: int, rngs: nnx.Rngs):
@@ -138,7 +114,6 @@ class ColaPi05(_pi0.Pi0):
         self.decoder_a = MessageDecoder(width_expert, rngs)  # A decodes B's message
         self.decoder_b = MessageDecoder(width_expert, rngs)  # B decodes A's message
 
-    # ------------------------------------------------------------------ prefix
     def _prefix(self, obs: _model.Observation):
         """Run PaliGemma over [image | prompt+state]; return its KV cache and a pooled vector."""
         obs = _model.preprocess_observation(None, obs, train=False, image_keys=(IMAGE_KEY,))
@@ -159,7 +134,6 @@ class ColaPi05(_pi0.Pi0):
             msg_b = jnp.zeros_like(msg_b)
         return self.decoder_a(msg_b), self.decoder_b(msg_a), msg_a, msg_b
 
-    # ------------------------------------------------------------------ suffix
     def _velocity(self, obs, prefix_mask, kv_cache, x_t, time, msg_cond):
         """One action-expert pass over the noisy chunk, attending to the cached prefix."""
         suffix_tokens, suffix_mask, suffix_ar_mask, time_cond = self.embed_suffix(obs, x_t, time)
@@ -178,7 +152,6 @@ class ColaPi05(_pi0.Pi0):
     def _stack(obs_a, obs_b):
         return jax.tree.map(lambda a, b: jnp.concatenate([a, b], axis=0), obs_a, obs_b)
 
-    # ------------------------------------------------------------------ train
     def compute_cola_loss(self, rng, obs_a, obs_b, actions_a, actions_b, *, use_messages: bool = True):
         """pi0.5's flow-matching loss for both arms, with CoLA's channel in between.
 
@@ -206,15 +179,8 @@ class ColaPi05(_pi0.Pi0):
         }
         return per[:n].mean(), per[n:].mean(), info
 
-    # ------------------------------------------ single arm, no channel (baseline)
     def compute_arm_loss(self, rng, obs, actions):
-        """pi0.5's own flow-matching loss for ONE arm, with no message at all.
-
-        The decentralised baseline: an independent pi0.5 policy per arm, each
-        seeing only its own wrist camera and joint state. Same prefix -> KV cache
-        -> suffix path as the CoLA model, with the message conditioning zeroed,
-        so the two rows differ only in whether the channel exists.
-        """
+        """pi0.5's own flow-matching loss for one arm, with no message (decentralised baseline)."""
         obs, prefix_mask, kv_cache, _ = self._prefix(obs)
         noise_rng, time_rng = jax.random.split(rng)
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -238,7 +204,6 @@ class ColaPi05(_pi0.Pi0):
             time = time + dt
         return x_t
 
-    # ------------------------------------------------------------------ act
     def sample_cola_actions(self, rng, obs_a, obs_b, *, num_steps: int = 10, use_messages: bool = True):
         """Both arms' chunks for one control step. Messages are computed once from
         this step's observations and held fixed across the denoising steps."""

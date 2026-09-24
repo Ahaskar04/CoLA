@@ -1,5 +1,5 @@
 <mujoco model="aloha_scene">
-  <compiler meshdir="assets" texturedir="assets"/>
+  <compiler meshdir="../assets" texturedir="../assets"/>
 
   <include file="aloha.xml"/>
 
@@ -90,19 +90,12 @@
     <geom class="frame" pos="0 -0.391 -0.01" quat="0 0 0 1" mesh="wormseye_mount"/>
     <body name="middle_box" pos="0 0 0.03">
       <freejoint name="middle_box_joint"/>
-      <!-- friction: sliding raised from MuJoCo's default 1.0 to 2.0, and
-           torsional from 0.005 to 0.05. The default made the box slip out of
-           B's fingers during the handover and the carry to the tray; torsional
-           matters as much as sliding here because the box PIVOTS between the
-           pads rather than sliding straight out.
-           NOTE any dataset collected before this change saw a slipperier box,
-           so a policy trained on it and evaluated here is off-distribution --
-           recollect after changing this. -->
+      <!-- Friction raised (sliding 2.0, torsional 0.05) so the box doesn't slip
+           or pivot out of the fingers. -->
       <geom name="middle_box_geom" type="box" size=".04 .02 .07" rgba="0.5 0.5 0.5 1"
             friction="2.0 0.05 0.0001"/>
-      <!-- Colored markers on face facing Arm A (negative x face) - only Arm A can see these.
-           One marker is randomly made visible at episode start by setting its rgba alpha to 1.
-           All start with alpha=0 (invisible) and the policy activates one. -->
+      <!-- Coloured markers on the box's -x face, visible only to arm A. All start
+           at alpha 0; one is made visible per episode. -->
       <geom name="marker_blue" type="box" pos="-0.041 0 0" size=".001 .019 .069" rgba="0 0 1 0" contype="0" conaffinity="0"/>
       <geom name="marker_green" type="box" pos="-0.041 0 0" size=".001 .019 .069" rgba="0 1 0 0" contype="0" conaffinity="0"/>
       <geom name="marker_yellow" type="box" pos="-0.041 0 0" size=".001 .019 .069" rgba="1 1 0 0" contype="0" conaffinity="0"/>

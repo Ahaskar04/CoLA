@@ -1,4 +1,4 @@
-# APPROACH and PICKUP phase 
+"""IK rig (three arms), gravity compensation, contact checks and constants for the scripted expert."""
 from pathlib import Path
 import mujoco
 import mujoco.viewer
@@ -31,13 +31,7 @@ def check_gripper_box_contact(model, data, box_geom_name="middle_box_geom"):
     return False
 
 def check_gripper_box_contact_right(model, data, box_geom_name="middle_box_geom"):
-    # Both fingers, mirroring check_gripper_box_contact above. The right-finger
-    # names were previously listed twice and the left-finger ones omitted, so a
-    # box seated against arm B's LEFT finger was held but never detected: grip_b
-    # waits on this predicate with no timeout, so those episodes froze mid-
-    # handover until max_steps. It cost 31/200 episodes in the first v3, all of
-    # them spawns in x ~ [-0.01, +0.04] -- exactly where RIGHT_TARGET_OFFSET
-    # (+0.03 in x) seats the box against the unlisted finger.
+    # Both finger pads.
     finger_geom_names = {"right/left_g0", "right/left_g1", "right/left_g2",
                           "right/right_g0", "right/right_g1", "right/right_g2"}
     box_geom_id = model.geom(box_geom_name).id
@@ -52,11 +46,7 @@ def check_gripper_box_contact_right(model, data, box_geom_name="middle_box_geom"
     return False
 
 def check_gripper_box_contact_third(model, data, box_geom_name="middle_box_geom"):
-    # BOTH finger sets, deliberately. The right-arm version of this function
-    # once listed the right-finger geoms twice and omitted the left ones, so a
-    # box seated against the unlisted finger was held but never DETECTED --
-    # grip_b waits on the predicate with no timeout, so those episodes froze
-    # until max_steps. It cost 31/200 episodes before it was caught.
+    # Both finger pads.
     finger_geom_names = {"third/left_g0", "third/left_g1", "third/left_g2",
                           "third/right_g0", "third/right_g1", "third/right_g2"}
     box_geom_id = model.geom(box_geom_name).id
@@ -71,8 +61,7 @@ def check_gripper_box_contact_third(model, data, box_geom_name="middle_box_geom"
     return False
 
 def setup_dual_arm_ik(xml_path):
-    # Name kept for compatibility: every caller imports setup_dual_arm_ik, and
-    # it now builds THREE arms when the scene provides them.
+    # Builds three arms when the scene has them (name kept for existing callers).
     model = mujoco.MjModel.from_xml_path(str(xml_path))
     data = mujoco.MjData(model)
     configuration = mink.Configuration(model)
@@ -103,8 +92,7 @@ def setup_dual_arm_ik(xml_path):
         gain = 0.05
     )
     posture_task = mink.PostureTask(model, cost=1e-4)
-    # third_ee_task must be in this list or mink never solves for arm C: the
-    # phases would write third/target and nothing would follow it.
+    # Arm C's task must be listed, or mink never solves for it.
     tasks = [left_ee_task, right_ee_task, third_ee_task, posture_task]
 
     left_joint_names = [
@@ -122,10 +110,9 @@ def setup_dual_arm_ik(xml_path):
         ["waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"]
     ]
 
-    # Arm C must be in all_joint_names or its velocity limit is never applied and
-    # it moves arbitrarily fast while the other two are capped.
+    # Include arm C so its velocity limit applies.
     all_joint_names = left_joint_names + right_joint_names + third_joint_names
-    velocity_limits = {name: 1.0 for name in all_joint_names}  # radians/sec, tune this number
+    velocity_limits = {name: 1.0 for name in all_joint_names}  # rad/s
     limits = [mink.VelocityLimit(model, velocity_limits)]
 
     left_dof_ids = np.array([model.joint(name).id for name in left_joint_names])
@@ -148,11 +135,10 @@ def setup_dual_arm_ik(xml_path):
     GRIPPER_CLOSED = 0.002
     left_subtree_id = model.body("left/base_link").id
     right_subtree_id = model.body("right/base_link").id
-    # Same gravity compensation as the other two: without it arm C sags under
-    # its own weight while A and B hold their pose.
+    # Gravity compensation for arm C too.
     third_subtree_id = model.body("third/base_link").id
 
-    # --- newly added: task-specific constants, previously hardcoded in the main script ---
+    # Task constants.
     GRASP_ORIENTATION_MATRIX = np.array([
         [ 0.217446,  0.0,        0.976072],
         [ 0.0,       1.0,        0.0     ],

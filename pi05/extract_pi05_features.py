@@ -1,24 +1,15 @@
-"""Pre-extract FROZEN pi0.5 features for the hidden-marker handover.
+"""Extract frozen pi0.5 features for the hidden-marker handover.
 
-The pi0.5 counterpart of CoLA's extract_features_h5.py. For every timestep of
-every episode, in the manifest order CoLA's action/state caches were written
-in, it runs pi0.5's PaliGemma prefix over that arm's own wrist image and prompt
-and saves the masked mean of the final hidden states:
+For every timestep, in CoLA's manifest order, runs pi0.5's PaliGemma prefix
+over the arm's own wrist image and prompt (task text plus the arm's
+discretised state, as pi0.5 expects) and saves the masked mean of the final
+hidden states:
 
     {split}_features_a.npy  (N, 2048) float32
     {split}_features_b.npy  (N, 2048) float32
 
-Row i lines up with row i of cache_marker_v1/{split}_actions_{a,b}.npy, which
-the trainer asserts. pi0.5 is frozen and never runs again during training.
-
-Prompt: pi0.5's native format, i.e. the task text plus the arm's own
-discretised joint state, produced by openpi's own tokenizer. pi05 was trained
-with the state in the prompt, so leaving it out would put the backbone
-off-distribution. CoLA's own ProprioEncoder still receives the raw state
-separately, exactly as in the Octo runs.
-
-Images come from pi05_marker_cache (built by pi05_marker_data.py: the same
-episodes, in the same order, resized to 224 with openpi's own resize_with_pad).
+Rows line up with {split}_actions_{a,b}.npy. Images come from the
+pi05_data.py cache.
 """
 import argparse
 import json
@@ -27,8 +18,7 @@ import pathlib
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-os.environ.setdefault("OPENPI_DATA_HOME", "/scratch/users/ntu/ahaskar0/openpi_cache")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import flax.nnx as nnx      # noqa: E402
 import jax                  # noqa: E402
@@ -40,14 +30,12 @@ import openpi.models.pi0 as _pi0                 # noqa: E402
 import openpi.models.pi0_config as _pi0_config   # noqa: E402
 import openpi.models.tokenizer as _tokenizer     # noqa: E402
 
-import pi05_marker_data as D                     # noqa: E402
-import train_cola_pi05 as T                      # noqa: E402
+import pi05_data as D                            # noqa: E402
+import train_cola_pi05_lora as T                 # noqa: E402
 
-# CoLA's own task prompt, used for both arms (cola_architecture.py:
-# create_tasks(texts=["coordinate with partner"])). The arms are distinguished
-# by which wrist camera and which state they see, as in the Octo runs.
+# CoLA's task prompt, shared by both arms (as in the Octo runs).
 PROMPT = "coordinate with partner"
-FEAT_DIR = pathlib.Path("/scratch/users/ntu/ahaskar0/pi05_marker_features")
+FEAT_DIR = pathlib.Path(__file__).resolve().parents[1] / "data" / "features" / "handover_marker_pi05"
 MAX_TOKEN_LEN = 64
 
 
@@ -55,8 +43,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", default=str(D.CACHE))
     ap.add_argument("--feat-dir", default=str(FEAT_DIR))
-    ap.add_argument("--action-cache", default="/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_marker_v1",
-                    help="CoLA's cache; row counts must match, as in extract_features_h5.py")
+    ap.add_argument("--action-cache", default=str(pathlib.Path(D.MANIFEST).parent),
+                    help="CoLA's cache; row counts must match, as in extract_features_2arm.py")
     ap.add_argument("--batch-size", type=int, default=64)
     args = ap.parse_args()
 
@@ -64,7 +52,7 @@ def main():
     feat_dir.mkdir(parents=True, exist_ok=True)
     D.build_cache(cache=args.cache)
 
-    # Plain pi0.5, no LoRA: every weight is the released pi05_base, frozen.
+    # Plain pi0.5 (no LoRA), fully frozen.
     config = _pi0_config.Pi0Config(pi05=True, action_horizon=D.CHUNK, max_token_len=MAX_TOKEN_LEN)
     t0 = time.time()
     model = T.build_model(config)

@@ -1,3 +1,15 @@
+"""Build the two-arm training cache: normalised actions and splits.
+
+Writes to cache_dir:
+    {split}_actions_{a,b}.npy   (N, 7), min/max mapped to [-0.9, 0.9]
+    {split}_episode_lens.npy    (n_episodes,)
+    action_stats.json           per-arm min/max, for denormalising
+    split_manifest.json         episode paths in row order
+
+The normaliser is fitted on the train split. The split is 80/10/10, stratified
+by episode success. Run prepare_states_2arm.py next for the joint states.
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -6,8 +18,9 @@ import h5py
 import numpy as np
 
 
-DATA_DIR = Path('/scratch/users/ntu/ahaskar0/aloha-handover-data')
-CACHE_DIR = Path('/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_aloha_handover')
+REPO = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO / 'data' / 'demos' / 'handover_2arm'
+CACHE_DIR = REPO / 'data' / 'cache' / 'handover_2arm'
 
 TRAIN_FRAC = 0.80
 VAL_FRAC = 0.10
@@ -15,9 +28,7 @@ VAL_FRAC = 0.10
 
 SEED = 42
 
-# Raw actions are mapped onto [-MARGIN, MARGIN] rather than [-1, 1]: tanh only
-# reaches +/-1 asymptotically, so leaving headroom keeps the extreme timesteps
-# reachable instead of demanding infinite pre-activations.
+# Actions map to [-MARGIN, MARGIN], leaving headroom inside tanh's range.
 MARGIN = 0.9
 # Column 6 of an action is the gripper; 0..5 are joints.
 GRIPPER_COL = 6
@@ -86,22 +97,9 @@ def load_actions(paths):
 
 
 def to_velocity(actions, lens):
-    """Absolute joint targets -> per-step deltas, respecting episode boundaries.
+    """Absolute joint targets -> per-step deltas, within each episode.
 
-    Chi et al. Fig 4 report that regression baselines (BCRNN, BET) do WORSE with
-    position control while Diffusion Policy does better: absolute targets carry
-    more action multimodality, which a distribution model exploits and an
-    L1 regressor averages into an invalid middle. Our deterministic head is a
-    regression baseline running in the configuration that ablation says hurts
-    it, so deltas are worth measuring.
-
-    The gripper column is left ABSOLUTE. It is binary and handled by a BCE head;
-    differencing it would produce three values (-1/0/+1 open, hold, close) and
-    break that head's assumption.
-
-    Differencing must not cross episode boundaries -- the last action of one
-    episode and the first of the next are unrelated poses, and a delta between
-    them is a fictional jump. The first step of each episode gets a zero delta.
+    The binary gripper column stays absolute; each episode's first delta is 0.
     """
     out = np.zeros_like(actions)
     start = 0
@@ -121,7 +119,7 @@ def fit_normaliser(actions):
     lo = actions.min(axis=0)
     hi = actions.max(axis=0)
     span = hi - lo
-    # A constant column would divide by zero; map it to 0 instead.
+    # Avoid dividing by zero on constant columns.
     span = np.where(span < 1e-8, 1.0, span)
     return lo.astype(np.float32), hi.astype(np.float32), span.astype(np.float32)
 
@@ -158,10 +156,7 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
-    # Optional cap on how many episodes to use at all. Subsample BEFORE the
-    # split so train/val/test stay 80/10/10 of the capped set, and do it
-    # stratified so the success ratio is preserved -- taking the first N by
-    # filename would bias toward whatever order collection happened to produce.
+    # Optional episode cap, applied before the split and stratified by success.
     if args.max_episodes and args.max_episodes < len(episodes):
         keep_idx = []
         for mask in (successes, ~successes):
@@ -170,8 +165,7 @@ def main():
             take = int(round(args.max_episodes * len(idx) / len(episodes)))
             keep_idx.append(idx[:take])
         keep = np.sort(np.concatenate(keep_idx))
-        # `episodes` is a list of Paths, so index it elementwise; successes and
-        # lengths are arrays and take the fancy index directly.
+        # episodes is a list; successes and lengths are arrays.
         episodes = [episodes[i] for i in keep]
         successes, lengths = successes[keep], lengths[keep]
         n_succ = int(successes.sum())
@@ -187,9 +181,7 @@ def main():
     print('\nLoading train actions to fit the normaliser...')
     train_a, train_b, train_lens = load_actions(train)
     if args.velocity:
-        # Fit on deltas, not absolute targets: their ranges differ by an order
-        # of magnitude, so reusing position stats would squash every delta to
-        # near zero after normalisation.
+        # Fit the normaliser on deltas (their range differs from positions).
         train_a = to_velocity(train_a, train_lens)
         train_b = to_velocity(train_b, train_lens)
     lo_a, hi_a, span_a = fit_normaliser(train_a)
@@ -202,8 +194,7 @@ def main():
     with open(args.cache_dir / 'action_stats.json', 'w') as f:
         json.dump({
             'margin': MARGIN,
-            # Rollout must know: velocity actions are integrated onto the
-            # current pose, position actions are written straight to ctrl.
+            # Tells the rollout whether to integrate actions or apply them directly.
             'velocity': bool(args.velocity),
             'source': 'train split of ' + str(args.data_dir),
             'action_a': {'min': lo_a.tolist(), 'max': hi_a.tolist()},
@@ -240,7 +231,7 @@ def main():
         json.dump(manifest, f, indent=2)
 
     print(f'\nWrote actions, episode lengths and manifest to {args.cache_dir}')
-    print('Next: extract_features_h5.py')
+    print('Next: extract_features_2arm.py')
 
 
 if __name__ == '__main__':

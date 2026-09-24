@@ -1,43 +1,14 @@
 #!/usr/bin/env python3
-"""Is the marker colour linearly decodable from CoLA's 64-d message?
+"""Probe whether the marker colour is linearly decodable from CoLA's message.
 
-Extracts msg_a = encoder_a(self_a) for every cached timestep of the
-hidden-marker task and fits a multinomial logistic regression from the message
-to the episode's marker colour. Chance is 33.3%.
-
-WHY THIS TASK. The marker is on the box face turned toward arm A and is
-occluded from B for the whole episode, so the colour is the one thing B cannot
-see and must receive. If the 81.8% correct-tray result is real, the colour has
-to be in the message.
-
-THREE PROBES, NOT ONE. A probe on the message alone is not interpretable on its
-own, so this runs all three and prints them together:
-
-  self_a  -- A's own representation, the encoder's INPUT. The ceiling: colour
-             the encoder never saw cannot be transmitted. If this is at chance
-             the whole analysis stops here and the 81.8% needs another
-             explanation.
-  msg_a   -- the 64-d message. The number of interest.
-  msg_a from the NO-MESSAGE checkpoint -- the control. That model's encoder
-             still exists and still takes gradients; only its output is zeroed
-             before the decoder reads it. If colour is decodable there too,
-             then decodability is a property of the features, NOT evidence that
-             the channel carries colour to B on purpose.
-
-WHAT THIS DOES AND DOES NOT SHOW. A high score is positive SIGNALLING: the
-information is present and linearly readable. It is NOT positive LISTENING --
-it says nothing about whether B's policy uses it. Only an intervention (feed B
-a message recorded from a different colour and see where the box lands) settles
-that. Lowe et al., AAMAS 2019.
-
-TIMESTEP CAVEAT. Every frame of an episode inherits that episode's colour
-label, so frames from one episode are not independent samples. Splitting
-frames at random would put neighbouring frames of the same episode on both
-sides and inflate the score toward 100% by memorising episodes. This script
-therefore splits BY EPISODE, and additionally reports a per-episode majority
-vote, which is the number that matches how the policy is actually scored.
-
-Runs on CPU in minutes; no GPU, no rollouts, no SU.
+Fits a multinomial logistic regression from each frame to its episode's marker
+colour (chance 1 in 3), with folds grouped by episode, on three inputs:
+    self_a   the encoder's input (ceiling)
+    msg_a    the message
+    msg_a    from the no-message checkpoint (control)
+Reports frame accuracy and per-episode majority-vote accuracy. Decodability
+shows the colour is present in the message, not that B uses it; the
+message-swap intervention tests that. CPU only.
 """
 
 import argparse
@@ -47,15 +18,13 @@ import sys
 
 import numpy as np
 
-REPO = "/scratch/users/ntu/ahaskar0/v1/cola-research-code"
-sys.path.insert(0, f"{REPO}/handover/cola")
+REPO = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 
-CACHE = "/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_marker_v1"
-FEATS = "/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/features_marker_v1"
-MSG_CKPT = (f"{REPO}/handover/cola/experiments/run_marker_wristmsg"
-            "/checkpoints/best_model.pkl")
-NOMSG_CKPT = (f"{REPO}/handover/cola/experiments/run_marker_wristnomsg"
-              "/checkpoints/best_model.pkl")
+CACHE = str(REPO / "data" / "cache" / "handover_marker")
+FEATS = str(REPO / "data" / "features" / "handover_marker")
+MSG_CKPT = str(REPO / "runs" / "handover_marker" / "checkpoints" / "best_model.pkl")
+NOMSG_CKPT = str(REPO / "runs" / "handover_marker_nomsg" / "checkpoints" / "best_model.pkl")
 COLORS = ("blue", "green", "yellow")
 
 
@@ -101,24 +70,21 @@ _MODEL_CACHE = {}
 def build_messages(ckpt_path, feat, state_n, feat_o=None):
     """msg_a = encoder_a(self_a), and self_a itself, for every frame.
 
-    COLAModel.__init__ loads the frozen Octo backbone (~90 s on CPU) even
-    though nothing here needs it: _self_repr and encoder_a are pure functions
-    of the checkpoint's params and the cached features. Models are therefore
-    cached per (use_proprio, use_overhead, ...) shape so the backbone loads
-    once per distinct configuration rather than once per call.
+    Models are cached per configuration, so the Octo backbone loads only once.
     """
     import pickle
     import jax.numpy as jnp
-    import cola_architecture as CA
+    import cola.model as CA
 
     ckpt = pickle.load(open(ckpt_path, "rb"))
     cfg = ckpt.get("config", {})
     params = ckpt["params"]
     use_proprio = bool(ckpt.get("use_proprio", cfg.get("use_proprio", False)))
     use_overhead = bool(ckpt.get("use_overhead", cfg.get("use_overhead", False)))
+    use_wrist = bool(ckpt.get("use_wrist", cfg.get("use_wrist", True)))
 
     model = CA.COLAModel(
-        use_proprio=use_proprio, use_overhead=use_overhead,
+        use_proprio=use_proprio, use_overhead=use_overhead, use_wrist=use_wrist,
         split_gripper=bool(ckpt.get("split_gripper", True)),
         use_diffusion=bool(cfg.get("use_diffusion", False)),
         diffusion_unet=bool(cfg.get("diffusion_unet", False)),
@@ -129,8 +95,7 @@ def build_messages(ckpt_path, feat, state_n, feat_o=None):
         raise SystemExit("checkpoint uses the overhead view but no "
                          "*_features_o.npy was loaded")
 
-    # Chunked: 150 episodes of features at 768-d is large enough that one
-    # device_put of the whole split is wasteful.
+    # Chunked to avoid one large device transfer.
     selves, msgs = [], []
     B = 4096
     for i in range(0, feat.shape[0], B):
@@ -142,33 +107,22 @@ def build_messages(ckpt_path, feat, state_n, feat_o=None):
         selves.append(np.asarray(self_a))
         msgs.append(np.asarray(msg_a))
     return np.concatenate(selves), np.concatenate(msgs), {
-        "use_proprio": use_proprio, "use_overhead": use_overhead,
+        "use_proprio": use_proprio, "use_overhead": use_overhead, "use_wrist": use_wrist,
         "use_messages": ckpt.get("use_messages"), "epoch": ckpt.get("epoch"),
     }
 
 
 def probe_cv(X, y, ep, n_folds=5, seed=0):
-    """Grouped k-fold over ALL episodes; every episode is held out exactly once.
+    """Grouped k-fold over all episodes, so every episode is held out once.
 
-    The fixed train/test split leaves only 15 test episodes (3 blue / 5 green /
-    7 yellow), where one episode is 6.7% of the episode-vote score and the
-    binomial spread on 15 draws swamps any difference from the 33.3% chance
-    rate. Cross-validating over all 150 episodes tests each one while still
-    training on ~120, so the estimate has 10x the evaluation sample at the same
-    training size.
-
-    Folds are grouped BY EPISODE, never by frame. Frames within an episode all
-    carry that episode's label and are highly correlated, so a frame-level
-    split would put neighbours on both sides and let the probe memorise
-    episodes -- inflating the score toward 100% regardless of what the message
-    encodes.
+    Folds are grouped by episode: frames within an episode share a label, so a
+    frame-level split would let the probe memorise episodes.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import StratifiedGroupKFold
     from sklearn.preprocessing import StandardScaler
 
-    # Stratified so each fold keeps the colour balance; grouped so an episode's
-    # frames never straddle a fold boundary.
+    # Stratified by colour, grouped by episode.
     skf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     frame_hit = frame_tot = 0
     ep_hit = ep_tot = 0
@@ -203,16 +157,14 @@ def probe(X_tr, y_tr, ep_tr, X_te, y_te, ep_te, seed=0):
     from sklearn.preprocessing import StandardScaler
 
     sc = StandardScaler().fit(X_tr)
-    # No multi_class= argument: it was removed in scikit-learn 1.8, where
-    # multinomial is the behaviour for a multi-class target anyway.
+    # No multi_class= argument (removed in scikit-learn 1.8; multinomial is the default).
     clf = LogisticRegression(max_iter=2000, random_state=seed)
     clf.fit(sc.transform(X_tr), y_tr)
 
     pred = clf.predict(sc.transform(X_te))
     frame_acc = float((pred == y_te).mean())
 
-    # Per-episode majority vote: the policy commits to ONE tray per episode, so
-    # this is the number that corresponds to how the task is scored.
+    # Per-episode majority vote: the policy commits to one tray per episode.
     ep_correct = ep_total = 0
     for e in np.unique(ep_te):
         m = ep_te == e
@@ -268,9 +220,7 @@ def main():
     results = {"chance": 100.0 / len(COLORS), "probes": {}}
 
     if a.cv:
-        # Episode indices are per-split, so offset each split's before pooling
-        # or episodes from different splits would share a group id and the
-        # grouped fold would leak across them.
+        # Offset per-split episode indices so groups don't collide across splits.
         pooled, off = {}, 0
         for split in ("train", "val", "test"):
             if split not in splits:

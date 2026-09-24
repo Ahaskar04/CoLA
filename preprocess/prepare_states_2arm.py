@@ -1,24 +1,8 @@
-"""
-Cache per-timestep proprioception for the ALOHA handover dataset.
+"""Cache z-scored joint states for the two-arm datasets.
 
-prepare_h5_handover.py caches actions but not states, and extract_features_h5.py
-reads only the images, so state_a/state_b sit unused in the .h5 files. This
-script fills that gap:
-
-    {split}_states_a.npy   (N, 7)  float32, z-scored
-    {split}_states_b.npy   (N, 7)  float32, z-scored
-    state_stats.json                per-arm mean/std, fitted on train only
-
-Rows follow split_manifest.json, the same order prepare_h5_handover.py and
-extract_features_h5.py used, so row i lines up with row i of
-{split}_actions_*.npy and {split}_features_*.npy.
-
-Cheap: no GPU, no Octo, just reads two small arrays per episode. Run it after
-prepare_h5_handover.py; it does not need the features to exist.
-
-Why z-score rather than the min/max mapping used for actions: the action
-normaliser exists to fit a tanh output range. States are an input, so what
-matters is that each dimension arrives at a comparable scale.
+Run after prepare_cache_2arm.py. Writes, in manifest row order:
+    {split}_states_{a,b}.npy   (N, 7), z-scored
+    state_stats.json           per-arm mean/std, fitted on train
 """
 
 import argparse
@@ -28,7 +12,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-CACHE_DIR = Path('/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_aloha_handover_v2')
+CACHE_DIR = Path(__file__).resolve().parents[1] / 'data' / 'cache' / 'handover_2arm'
 
 
 def load_states(paths):
@@ -52,12 +36,11 @@ def main():
 
     manifest_path = args.cache_dir / 'split_manifest.json'
     if not manifest_path.exists():
-        raise SystemExit(f'Missing {manifest_path}. Run prepare_h5_handover.py first.')
+        raise SystemExit(f'Missing {manifest_path}. Run prepare_cache_2arm.py first.')
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    # Fit on train only, for the same reason the action stats are: val/test must
-    # not leak into the normaliser.
+    # Fit on train only, so val/test don't leak into the statistics.
     train_a, train_b, _ = load_states(manifest['splits']['train'])
     mean_a, std_a = train_a.mean(0), train_a.std(0)
     mean_b, std_b = train_b.mean(0), train_b.std(0)

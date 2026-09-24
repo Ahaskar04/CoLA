@@ -1,20 +1,11 @@
 """Hidden-marker handover demos in pi0.5's input format, one row per timestep.
 
-Episodes and splits are CoLA's own (cache_marker_v1/split_manifest.json:
-120/15/15 of aloha-marker-handover-v1). Chunk starts follow CoLA's rule --
-every t whose 10-step chunk stays inside its episode -- so steps/epoch and the
-150-epoch budget are CoLA's (135 x 150 = 20,250 at batch 128).
-
-Per arm, per timestep, exactly what openpi's pi0.5 pipeline would produce:
-  image   : that arm's wrist camera, resize_with_pad to 224 (openpi's own op)
-  state   : 7-d joints+gripper, quantile-normalised (pi0.5 convention), then
-            written into the prompt as 256-bin tokens by openpi's PaligemmaTokenizer
+Uses CoLA's episodes, splits and chunk starts. Per arm and timestep:
+  image   : that arm's wrist camera, resize_with_pad to 224
+  state   : 7-d joints + gripper, quantile-normalised, tokenised into the prompt
   actions : absolute 7-d joint targets, quantile-normalised, zero-padded to 32
-Arm A reads image_wrist_a / state_a / action_a, arm B the _b keys. Nothing of
-the partner's observation is ever in an arm's row.
-
-Everything derived is cached as .npy under CACHE so that each time-limited
-training segment starts in seconds rather than re-reading 150 HDF5 files.
+An arm's row never contains its partner's observation. Derived arrays are
+cached as .npy.
 """
 
 import json
@@ -26,8 +17,9 @@ import numpy as np
 import openpi.models.tokenizer as _tokenizer
 import openpi.shared.normalize as _normalize
 
-MANIFEST = "/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_marker_v1/split_manifest.json"
-CACHE = pathlib.Path("/scratch/users/ntu/ahaskar0/pi05_marker_cache")
+_DATA = pathlib.Path(__file__).resolve().parents[1] / "data"
+MANIFEST = str(_DATA / "cache" / "handover_marker" / "split_manifest.json")
+CACHE = _DATA / "cache" / "handover_marker_pi05"
 CHUNK = 10
 ACTION_DIM = 32
 STATE_RAW = 7
@@ -140,9 +132,7 @@ class MarkerSplit:
     index so a resumed segment draws exactly the batches an unbroken run would."""
 
     def __init__(self, split, cache=CACHE, in_memory=True):
-        # In memory by default. The first training segment ran at 9.2 s/step
-        # against 6.8 s/step in profiling; random-row reads through a memory
-        # map on Lustre are the suspected cause. Same values either way.
+        # Loaded into memory by default (memory-mapped random reads were slow).
         cache = pathlib.Path(cache)
         load = lambda k: np.load(cache / f"{split}_{k}.npy", mmap_mode=None if in_memory else "r")  # noqa: E731
         self.arrays = {f"{k}_{arm}": load(f"{k}_{arm}") for k in ("img", "state", "tok", "tokmask", "act")

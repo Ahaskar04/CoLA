@@ -1,19 +1,9 @@
-"""
-COLA 3-arm dataset loader (pre-extracted features + action chunking).
+"""Three-arm dataset: cached Octo-Base features and action chunks.
 
-Same contract as the 2-arm cola_dataset.py -- 768-dim Octo features written by
-extract_features_3arm.py, actions/states written by prepare_h5_3arm.py, episode
-boundaries from {split}_episode_lens.npy -- extended to three arms.
-
-The only structural change: every per-arm array is held in a dict keyed by arm
-instead of separate _a/_b attributes, so adding arm C did not mean a third copy
-of each line. Batches therefore carry
-
-    features: {'a': (B,768), 'b': ..., 'c': ...}
-    action:   {'a': (B,chunk,7), ...}
-    state:    {'a': (B,7), ...}          (use_states only)
-
-rather than flat 'features_a'/'features_b' keys.
+Same format as cola/dataset.py, with per-arm dicts:
+    features: {'a': (B, 768), 'b': ..., 'c': ...}
+    action:   {'a': (B, chunk, 7), ...}
+    state:    {'a': (B, 7), ...}   (use_states only)
 """
 
 import numpy as np
@@ -26,10 +16,7 @@ ARMS = ('a', 'b', 'c')
 
 
 def _build_valid_start_indices(episode_lens: np.ndarray, chunk_size: int) -> np.ndarray:
-    """
-    Given concatenated episode lengths, return global timestep indices where
-    a chunk of `chunk_size` consecutive actions stays within one episode.
-    """
+    """Global indices where a chunk of `chunk_size` actions stays in one episode."""
     starts = np.concatenate([[0], np.cumsum(episode_lens)[:-1]])
     counts = np.clip(episode_lens - chunk_size + 1, a_min=0, a_max=None)
 
@@ -42,7 +29,7 @@ def _build_valid_start_indices(episode_lens: np.ndarray, chunk_size: int) -> np.
 
 
 class COLADataset3Arm:
-    """Feature-based dataset: pre-extracted 768-dim Octo features, three arms."""
+    """Pre-extracted 768-d Octo features, actions and (optionally) states, three arms."""
 
     def __init__(
         self,
@@ -65,7 +52,7 @@ class COLADataset3Arm:
         self.features = {
             arm: np.load(feat_dir / f'{split}_features_{arm}.npy') for arm in ARMS
         }
-        # One fixed third-person view shared by all three arms.
+        # Overhead view shared by all arms.
         self.features_o = None
         if use_overhead:
             fo = feat_dir / f'{split}_features_o.npy'
@@ -80,20 +67,18 @@ class COLADataset3Arm:
             arm: np.load(cache_dir / f'{split}_actions_{arm}.npy') for arm in ARMS
         }
 
-        # Proprioception, written by prepare_h5_3arm.py in manifest order so
-        # row i matches row i of the features and actions.
+        # States from prepare_cache_3arm.py, row-aligned with features and actions.
         self.states = None
         if use_states:
             first = cache_dir / f'{split}_states_a.npy'
             if not first.exists():
                 raise FileNotFoundError(
-                    f'Missing {first}. Run prepare_h5_3arm.py first.')
+                    f'Missing {first}. Run prepare_cache_3arm.py first.')
             self.states = {
                 arm: np.load(cache_dir / f'{split}_states_{arm}.npy') for arm in ARMS
             }
 
-        # Every array must describe the same timeline, or an arm is silently
-        # trained against another arm's frames.
+        # All arrays must share one timeline.
         n = len(self.features['a'])
         for arm in ARMS:
             assert len(self.features[arm]) == n, \
@@ -110,7 +95,7 @@ class COLADataset3Arm:
         lens_path = cache_dir / f'{split}_episode_lens.npy'
         if not lens_path.exists():
             raise FileNotFoundError(
-                f'Missing {lens_path}. Run prepare_h5_3arm.py first.')
+                f'Missing {lens_path}. Run prepare_cache_3arm.py first.')
         episode_lens = np.load(lens_path)
         assert int(episode_lens.sum()) == n, \
             f'{split}: episode_lens sum to {int(episode_lens.sum())}, data has {n} rows'
@@ -132,9 +117,7 @@ class COLADataset3Arm:
         if self.use_overhead:
             batch['features_o'] = self.features_o[start_indices]
         if self.use_states:
-            # State at the query timestep only, matching the features: the
-            # policy conditions on where the arm is now, then predicts the whole
-            # chunk from there.
+            # State at the query timestep only, like the features.
             batch['state'] = {arm: self.states[arm][start_indices] for arm in ARMS}
         return batch
 
@@ -148,10 +131,9 @@ class COLADataset3Arm:
 
 if __name__ == '__main__':
     import sys
-    cache = sys.argv[1] if len(sys.argv) > 1 else \
-        '/scratch/users/ntu/ahaskar0/v1/cola-3arm-scratchdata/cache_aloha_handover_3arm/'
-    feats = sys.argv[2] if len(sys.argv) > 2 else \
-        '/scratch/users/ntu/ahaskar0/v1/cola-3arm-scratchdata/features_aloha_handover_3arm/'
+    data = Path(__file__).resolve().parents[1] / 'data'
+    cache = sys.argv[1] if len(sys.argv) > 1 else data / 'cache' / 'handover_3arm'
+    feats = sys.argv[2] if len(sys.argv) > 2 else data / 'features' / 'handover_3arm'
     ds = COLADataset3Arm(cache_dir=cache, feat_dir=feats, split='train')
     print(f'\nDataset size (valid chunk-starts): {len(ds)}')
     batch = ds.get_batch(32)

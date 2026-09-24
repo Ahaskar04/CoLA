@@ -1,5 +1,5 @@
 <mujoco model="aloha_scene">
-  <compiler meshdir="assets" texturedir="assets"/>
+  <compiler meshdir="../assets" texturedir="../assets"/>
 
   <include file="aloha.xml"/>
 
@@ -50,21 +50,12 @@
     <site name="worldref" pos="0 0 -0.75"/>
     <geom mesh="tabletop" material="table" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>
     <geom mesh="tablelegs" material="table" class="visual" pos="0 0 -0.75" quat="1 0 0 1"/>
-    <!-- Second table butted against the first, for arm C at x=+1.65. The
-         meshes are placed with quat="1 0 0 1", so their local y (extent
-         1.2192) is the world X direction: offsetting by that much puts the
-         copy edge-to-edge, spanning x +0.61..+1.83. Duplicating rather than
-         editing tabletop.obj/tablelegs.obj keeps the leg proportions right --
-         stretching those meshes would fatten the legs, not just space them. -->
+    <!-- Second table for arm C (x=+1.65), edge to edge with the first
+         (meshes duplicated rather than stretched). -->
     <geom mesh="tabletop" material="table" class="visual" pos="1.2192 0 -0.75" quat="1 0 0 1"/>
     <geom mesh="tablelegs" material="table" class="visual" pos="1.2192 0 -0.75" quat="1 0 0 1"/>
     <geom name="table" pos="0 0 -0.1009" size="0.61 0.37 0.1" type="box" class="collision"/>
-    <!-- Collision for the second table. The visual meshes above are duplicated
-         at x offset 1.2192, but those are class="visual" and carry no contact,
-         so without this a box handed to arm C (x=+1.65) drops straight through
-         a table that is drawn but not there. Mirrors the first geom exactly,
-         shifted by the same offset, giving a continuous surface
-         x -0.61 .. +1.83. -->
+    <!-- Collision geom for the second table (the visual meshes carry no contact). -->
     <geom name="table2" pos="1.2192 0 -0.1009" size="0.61 0.37 0.1" type="box" class="collision"/>
     <camera name="overhead_cam" focal="1.93e-3 1.93e-3" resolution="1280 720" sensorsize="3896e-6 2140e-6"
       pos="0.6096 -0.303794 1.4" mode="fixed" quat="0.976332 0.216277 0 0"/>
@@ -113,7 +104,7 @@
     <body name="right/target" mocap="true" pos="0 0 0.3">
       <geom type="sphere" size=".02" rgba="0 1 0 0" contype="0" conaffinity="0"/>
     </body>
-    <!-- IK target for arm C. Making visible for debugging (alpha=1 instead of 0) -->
+    <!-- IK target for arm C (invisible). -->
     <body name="third/target" mocap="true" pos="0 0 0.3">
       <geom type="sphere" size=".02" rgba="0 1 0 0" contype="0" conaffinity="0"/>
     </body>

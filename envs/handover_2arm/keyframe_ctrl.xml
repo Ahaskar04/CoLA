@@ -3,23 +3,9 @@
     <key name="neutral_pose" qpos="0 -0.96 1.16 0 -0.3 0 0.0084 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084 0.0084"
       ctrl="0 -0.96 1.16 0 -0.3 0 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084"/>
 
-    <!-- Arm A holding the box, arm B at neutral: the state a handover-only
-         episode starts from.
-         A's wrist is at the expert's own GRASP_ORIENTATION (pitched ~77 deg
-         down, quat 0.7802 0 0.6255 0) rather than the neutral forward-pointing
-         pose. That matters: expert_step() commands GRASP_ORIENTATION on every
-         phase before retract_b, so a keyframe holding the box level makes the
-         wrist snap 77 deg on step 1 -- visible as the box lurching before the
-         arm settles. Starting already at the grasp pose leaves nothing to
-         rotate, and matches how the box hangs in the full task after a real
-         pickup, which is what approach_b's offsets were tuned against.
-         Built by IK from neutral, then settled 800 steps under gravity: the box
-         hangs below the gripper site and stays gripped. A grips ~35% from its
-         own end of the box rather than dead centre, leaving more clear length
-         for B; 25% was requested but the box slides toward the finger centre
-         during the settle, and 35% is what survives physics.
-         Both grippers' ctrl is 0.002 (CLOSED) -- an open value springs the
-         fingers and drops the box on step 1.
+    <!-- Handover-only start: arm A holds the box at the expert's
+         GRASP_ORIENTATION, arm B at neutral. Built by IK, then settled 800
+         steps under gravity. Both gripper ctrls are 0.002 (closed).
          23 qpos: arms 0-15, box freejoint 16-22 (xyz + wxyz quat). -->
     <key name="handover_start"
       qpos="-0.00031897 -0.37959 0.25575 -0.00068292 1.5499 -0.00040862 0.026471 0.028652 0 -0.95941 1.1996 -0.00069466 -0.2477 0 0.0078483 0.0086446 -0.27752 -0.018119 0.27557 0.76666 0.00044521 0.64205 -0.00032356"

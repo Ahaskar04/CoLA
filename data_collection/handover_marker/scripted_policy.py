@@ -1,3 +1,5 @@
+"""Scripted expert for the hidden-marker handover: pick, hand over, place in the marker's tray."""
+
 from pathlib import Path
 import mujoco
 import mujoco.viewer
@@ -10,7 +12,7 @@ from utils import setup_dual_arm_ik, compensate_gravity, check_gripper_box_conta
 
 _HERE = Path(__file__).parent
 _PROJECT_ROOT = _HERE.parent.parent  
-_XML = _PROJECT_ROOT / "environments" / "handover_2arm_marker" / "scene.xml"
+_XML = _PROJECT_ROOT / "envs" / "handover_marker" / "scene.xml"
 
 setup = setup_dual_arm_ik(_XML)
 
@@ -37,11 +39,7 @@ class EpisodeData:
         self.action_b = []
         self.box_pos = []
         self.phase = []
-        # Which marker is visible this episode. Constant for the episode, so it
-        # is a scalar rather than a per-step column. Set by run_episode after it
-        # draws the colour. WITHOUT THIS the dataset cannot be scored for
-        # CORRECT-tray placement, only "landed in some tray" -- which discards
-        # the 33% chance baseline the whole task is built around.
+        # Marker colour for the episode (needed to score correct-tray placement).
         self.marker_color = None
 
     def add_step(self, image_overhead, image_wrist_a, image_wrist_b,
@@ -67,22 +65,14 @@ class EpisodeData:
             "action_b": np.array(self.action_b),
             "box_pos": np.array(self.box_pos),
             "phase": np.array(self.phase, dtype="S20"),
-            # Fixed-width bytes, matching how `phase` is stored: h5py cannot
-            # write a bare Python str, and "yellow" is the longest value.
+            # Fixed-width bytes, like `phase` (h5py can't write a bare str).
             "marker_color": np.array(self.marker_color or "unknown", dtype="S10"),
         }
 
 
 
 class ExpertState:
-    """The scripted expert's carried state.
-
-    The expert is a phase machine, so it cannot be queried from a bare
-    (model, data) snapshot: `phase` says which stage it believes it is in, and
-    `target_pos` / `target_pos_b` are IK goals that each phase MUTATES rather
-    than recomputing from scratch. `configuration` is mink's own copy of the
-    joint state. All of it has to be carried between steps.
-    """
+    """The expert's state carried between steps (phase, IK targets, mink configuration)."""
 
     __slots__ = ('phase', 'target_pos', 'target_pos_b', 'gripper_ctrl',
                  'right_gripper_ctrl', 'left_neutral_pos', 'left_neutral_quat',
@@ -107,41 +97,22 @@ class ExpertState:
         return _copy.deepcopy(self)
 
 
-# Constants the phase machine uses. Module level so expert_step() and
-# run_episode() cannot drift apart.
+# Constants shared by expert_step() and run_episode().
 DT = 1.0 / 200.0
 APPROACH_HEIGHT_OFFSET = 0.10
 POS_THRESHOLD = 0.02
 B_APPROACH_HEIGHT_OFFSET = 0.08
-# How close B's gripper site ends up to A's. 0.03 was tuned for B reaching
-# DOWN onto a box lying flat; coming in horizontally at a box held out
-# sideways it left B short, closing just outside the box. 0.01 brings it
-# deeper still: at +0.01 two of five episodes sat in grip_b for 140+ steps
-# closing on air, so B's target now sits 1cm PAST A's gripper site and the
-# fingers straddle the box. The box is 8cm long, so there is room.
-# 1cm deeper than the 0.03 the dataset was collected at. Earlier depth tests
-# (0.01 -> 2/5, -0.01 -> 0/5, B pushing the box away) predate the
-# B_GRIP_THRESHOLD fix, when B closed 4.5cm short no matter where its
-# target sat -- so they are confounded and worth redoing.
-RIGHT_TARGET_OFFSET = np.array([-0.03, 0.0, 0.03])  # x-3cm reaches deeper toward Arm A, z+3cm raises handover point
-# approach_b -> grip_b used POS_THRESHOLD (0.02), so B started closing while
-# still 2cm short of its own target -- which is itself 3cm from A's gripper.
-# Tracing grip_b showed B shutting its fingers 4.5cm from the box with ZERO
-# right/* contacts: it closed on air, then A released into nothing and the
-# box fell. Require B to actually arrive before it grips.
+# Offset of B's grasp target from A's gripper site.
+RIGHT_TARGET_OFFSET = np.array([-0.03, 0.0, 0.03])  # 3 cm deeper toward A, 3 cm higher
+# B must reach its target this closely before closing its gripper.
 B_GRIP_THRESHOLD = 0.005
 A_GRASP_OFFSET = np.array([-0.02, 0.0, 0.0])
-# Where arm A holds the box out for the handover, on the axis between the
-# two arms (A base x=-0.55, B base x=+0.55, midline x=0). Handover-only
-# episodes start with A at neutral, so without a phase that moves it the
-# whole transfer is done by B travelling across the table.
+# x at which arm A presents the box, near the midline between the arms.
 PRESENT_X = -0.02
-# Camera the human-review video is rendered from. COLA_REVIEW_CAMERA=wrist_cam_left
-# shows arm A's own point of view -- what the policy actually sees.
+# Camera for the review video (COLA_REVIEW_CAMERA=wrist_cam_left shows arm A's view).
 REVIEW_CAMERA = os.environ.get("COLA_REVIEW_CAMERA", "overhead_cam")
 
-# Tray positions for the marker task: Arm B drops the box in the matching tray.
-# All trays are at x=0.36 (Arm B's side), height z=0.20 (above tray surface).
+# Tray drop points (on arm B's side), one per marker colour.
 TRAY_POSITIONS = {
     "blue":   np.array([0.36, -0.247, 0.20]),
     "green":  np.array([0.36,  0.0,   0.20]),
@@ -150,21 +121,12 @@ TRAY_POSITIONS = {
 
 
 def expert_step(setup, est, sync_configuration=False):
-    """One step of the scripted expert: decide, solve IK, advance the phase.
+    """One expert step: choose targets, solve IK, advance the phase.
 
-    Returns (action_a, action_b, est) where each action is
-    [6 joint targets, gripper] -- exactly the layout collect_demos.py records.
-
-    Does NOT write data.ctrl and does NOT step physics, so it can run alongside
-    a learned policy that owns the arms (DAgger observer mode).
-
-    sync_configuration=True re-seeds mink from data.qpos before solving. Needed
-    whenever something OTHER than this function moved the arms -- otherwise the
-    expert computes a correction from a pose the arm is not actually in.
-
-    NOTE: this writes data.mocap_pos/quat, because mink reads the IK target back
-    out of the mocap bodies. The marker geoms are alpha 0, so this does not
-    change what any camera sees.
+    Returns (action_a, action_b, est), each action [6 joint targets, gripper].
+    Doesn't write data.ctrl or step physics. sync_configuration=True re-seeds
+    mink from data.qpos (needed if something else moved the arms). Writes the
+    mocap targets that mink reads.
     """
     model = setup["model"]
     data = setup["data"]
@@ -205,15 +167,11 @@ def expert_step(setup, est, sync_configuration=False):
         est.target_pos = np.array([box_pos[0] + A_GRASP_OFFSET[0], box_pos[1], LIFT_HEIGHT])
 
     elif phase == "present_a":
-        # Only x is overridden: y and z keep whatever the reset randomised,
-        # so the presentation pose still varies episode to episode.
+        # Override x only; y and z keep the presentation pose.
         est.target_pos = np.array([PRESENT_X, est.target_pos[1], est.target_pos[2]])
 
     elif phase == "move_arm_B":
-        # Stage OUTWARD along x (B's own side), not above. The old
-        # [0, 0, B_APPROACH_HEIGHT_OFFSET] put B 8cm over the box so approach_b
-        # then dropped onto it -- correct for a box lying on the table, wrong
-        # for one held out horizontally, where B should come in from the side.
+        # Stage B outward along x, so it approaches the held box from the side.
         est.target_pos_b = est.target_pos + RIGHT_TARGET_OFFSET + np.array([B_APPROACH_HEIGHT_OFFSET, 0.0, 0.0])
         data.mocap_pos[right_mocap_id] = est.target_pos_b
         right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
@@ -236,7 +194,7 @@ def expert_step(setup, est, sync_configuration=False):
         right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
 
     elif phase == "move_to_tray":
-        # Move Arm B over the correct colored tray based on the marker
+        # Move arm B over the tray matching the marker.
         if est.chosen_color is not None and est.chosen_color in TRAY_POSITIONS:
             tray_pos = TRAY_POSITIONS[est.chosen_color]
             est.target_pos_b = tray_pos.copy()
@@ -244,11 +202,11 @@ def expert_step(setup, est, sync_configuration=False):
             right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
 
     elif phase == "drop_box":
-        # Open gripper to drop the box into the tray
+        # Open the gripper to drop the box into the tray.
         est.right_gripper_ctrl = gripper_open
 
     elif phase == "wait_drop":
-        # Keep gripper open and wait for box to fall
+        # Keep the gripper open while the box falls.
         est.right_gripper_ctrl = gripper_open
 
     if phase not in ("retract_b", "move_to_tray", "drop_box", "wait_drop"):
@@ -288,24 +246,24 @@ def expert_step(setup, est, sync_configuration=False):
     elif phase == "release_a" and gripper_is_open:
         est.phase = "retract_b"
     elif phase == "retract_b" and np.linalg.norm(right_gripper_pos - est.right_neutral_pos) < POS_THRESHOLD:
-        # After retract, move to the correct tray based on marker color
+        # After retracting, move to the marker's tray.
         est.phase = "move_to_tray"
     elif phase == "move_to_tray":
-        # Looser threshold for tray positioning (0.05 = 5cm) since exact placement isn't critical
+        # Looser threshold (5 cm) for tray positioning.
         if dist_right_to_target < 0.05:
             est.phase = "drop_box"
     elif phase == "drop_box":
-        # Check if right gripper is open - once open, transition to wait_drop
+        # Once the right gripper is open, wait for the drop.
         right_gripper_qpos = data.joint('right/left_finger').qpos[0]
         right_gripper_is_open = abs(right_gripper_qpos - gripper_open) < 0.01
         if right_gripper_is_open:
             est.phase = "wait_drop"
-            # Initialize drop wait counter
+            # Start the drop-wait counter.
             if not hasattr(expert_step, '_drop_wait_count'):
                 expert_step._drop_wait_count = 0
             expert_step._drop_wait_count = 0
     elif phase == "wait_drop":
-        # Wait 100 steps (~0.5 sec at 200Hz) for box to actually fall
+        # Wait 100 steps (0.5 s at 200 Hz) for the box to fall.
         if not hasattr(expert_step, '_drop_wait_count'):
             expert_step._drop_wait_count = 0
         expert_step._drop_wait_count += 1
@@ -323,13 +281,10 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
                  review_video_every_n_steps=10,
                  handover_only=False,
                  episode_idx=None):
-    """
-    Run one full pick-and-handover episode, headless (no live viewer).
+    """Run one full pick-and-handover episode headlessly.
 
-    Returns:
-        episode_data: EpisodeData object (or None if record_training_data=False)
-        success: bool, True if the episode reached the "done" phase
-        review_frames: list of rendered frames for a human-review video (or None)
+    Returns (episode_data, success, review_frames); episode_data and
+    review_frames are None when not recorded.
     """
     model = setup["model"]
     data = setup["data"]
@@ -363,24 +318,18 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
     B_APPROACH_HEIGHT_OFFSET = 0.08
     right_target_offset = np.array([0.03, 0.0, 0.0])
 
-    # Marker colors: randomly select one to be visible each episode.
-    # The marker geoms start with alpha=0 (invisible); we set the chosen one to alpha=1.
+    # One marker is made visible per episode (the others stay at alpha 0).
     MARKER_COLORS = ["blue", "green", "yellow"]
     marker_geom_ids = {
         color: model.geom(f"marker_{color}").id for color in MARKER_COLORS
     }
 
     if handover_only:
-        # Start mid-task: arm A already holds the box, so the episode is the
-        # handover alone. The keyframe is one settled equilibrium pose; the
-        # randomisation below moves the whole grasp (arm + box together) so
-        # every episode presents the box somewhere different.
+        # Handover-only: start with arm A holding the box.
         mujoco.mj_resetDataKeyframe(model, data, model.key("handover_start").id)
         mujoco.mj_forward(model, data)
 
-        # Select marker color: cycle through colors for balanced distribution.
-        # If episode_idx is provided, use it to deterministically pick color.
-        # Otherwise fall back to random selection.
+        # Marker colour: cycles with episode_idx when given (balanced), else random.
         if episode_idx is not None:
             chosen_color = MARKER_COLORS[episode_idx % len(MARKER_COLORS)]
         else:
@@ -395,47 +344,21 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
 
         grip0 = data.site('left/gripper').xpos.copy()
         box0 = data.qpos[box_joint_id: box_joint_id + 3].copy()
-        # Capture A's REST pose now, before the mocap is repointed at the IK
-        # goal below. left_neutral_pos is read off the mocap further down, so
-        # without this it would be set to the handover pose and `retract_a`
-        # would have nowhere to retract to.
+        # Record A's rest pose before the mocap is retargeted (retract_a returns to it).
         mink.move_mocap_to_frame(model, data, "left/target", "left/gripper", "site")
         rest_pos_a = data.mocap_pos[left_mocap_id].copy()
         rest_quat_a = data.mocap_quat[left_mocap_id].copy()
-        # x is the axis SEPARATING the two arms (left base at x=-0.55, right at
-        # x=+0.55), so it sets how far apart they meet. Hold it fixed: the arms
-        # should always rendezvous at the same point along that axis, and the
-        # variation should be in where A presents the box within its own
-        # workspace -- left/right (y) and up/down (z).
-        #
-        # y is capped at 0.07, not the 0.10 first tried: at y=+0.108 arm B could
-        # not reach the presentation point at all and the episode sat in
-        # move_arm_B for its full 200 steps. Every episode that completed had
-        # |y| <= 0.065, so beyond ~0.07 the failures are unreachable geometry
-        # rather than hard coordination.
-        #
-        # z is the axis with NO prior variation: every full-task demo lifts to
-        # LIFT_HEIGHT, giving recorded handover height std 0.003, so arm B has
-        # never seen the box presented at a different height.
-        # Capped at 0.06: every failure across the tuning runs was a HIGH
-        # presentation (z 0.33-0.35) where B cannot reach, while every
-        # success was z <= 0.31. At +-0.08 those high draws fail and get
-        # retried with lower ones, so the kept episodes skew low instead of
-        # spanning the range -- less usable height diversity, not more.
+        # Zero presentation offset: every episode starts from the same pose, so
+        # the marker colour is the only thing that varies.
         offset = np.array([
             0.0,
             0.0,
             0.0,
         ])
 
-        # Only run IK if there's an actual offset to move to. When offset is
-        # zero, the keyframe pose is already correct and running IK can cause
-        # the solver to find an alternative joint configuration that reaches
-        # the same Cartesian position -- making the arm "dance" unnecessarily.
+        # Skip IK for a zero offset (the keyframe pose is already correct).
         if np.any(offset != 0):
-            # Drive A's gripper to the offset pose with IK, carrying the box: the
-            # box is only held by contact, so moving it independently would push it
-            # out of the fingers.
+            # Move A's gripper (and the held box) to the offset pose with IK.
             configuration.update(data.qpos)
             posture_task.set_target_from_configuration(configuration)
             data.mocap_pos[left_mocap_id] = grip0 + offset
@@ -457,8 +380,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
                 if np.linalg.norm(data.site('left/gripper').xpos - goal_a) < 0.005:
                     break
 
-        # Reject rather than record a dropped box: an episode that starts with
-        # nothing in the gripper trains the policy on an impossible task.
+        # Reject episodes where the box was dropped during the reset.
         if not check_gripper_box_contact(model, data):
             return None, False, None
 
@@ -478,7 +400,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
         mink.move_mocap_to_frame(model, data, "left/target", "left/gripper", "site")
         mink.move_mocap_to_frame(model, data, "right/target", "right/gripper", "site")
         mujoco.mj_forward(model, data)
-        # For non-handover mode, we don't use marker-based tray placement
+        # No marker in full-task mode.
         chosen_color = None
 
     
@@ -500,9 +422,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
 
     episode_data = EpisodeData() if record_training_data else None
     if episode_data is not None:
-        # chosen_color is bound only in the handover_only branch above -- the
-        # full-task branch never draws a marker -- so read it defensively
-        # rather than by bare name, which would raise NameError there.
+        # chosen_color only exists in handover-only mode.
         episode_data.marker_color = locals().get('chosen_color')
     review_frames = [] if record_review_video else None
     renderer = mujoco.Renderer(model, 256, 256) if (record_training_data or record_review_video) else None
@@ -512,8 +432,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
     target_pos_b = data.site('right/gripper').xpos.copy()
     A_GRASP_OFFSET = np.array([-0.02, 0.0, 0.0]) 
 
-    # Single source of truth: the phase machine lives in expert_step() so the
-    # DAgger collector queries exactly the same expert this records.
+    # The phase machine lives in expert_step().
     est = ExpertState(
         phase=phase,
         target_pos=target_pos,
@@ -544,7 +463,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
         compensate_gravity(model, data, [left_subtree_id, right_subtree_id])
         mujoco.mj_step(model, data)
 
-        # --- capture training data every step ---
+        # Capture training data every step
         if record_training_data and step_count % record_every_n_steps == 0:
             state_a = np.concatenate([data.qpos[left_dof_ids], [gripper_qpos]])
             state_b = np.concatenate([data.qpos[right_dof_ids], [right_gripper_qpos]])
@@ -563,7 +482,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=2000,
                 phase=phase,
             )
 
-        # --- capture review video, sparsely (not every step, for speed) ---
+        # Capture review video, sparsely (not every step, for speed)
         if record_review_video and step_count % review_video_every_n_steps == 0:
             renderer.update_scene(data, camera=REVIEW_CAMERA)
             review_frames.append(renderer.render())

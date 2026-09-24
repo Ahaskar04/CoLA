@@ -1,4 +1,4 @@
-# APPROACH and PICKUP phase 
+"""IK rig, gravity compensation, contact checks and constants for the scripted expert."""
 from pathlib import Path
 import mujoco
 import mujoco.viewer
@@ -31,13 +31,7 @@ def check_gripper_box_contact(model, data, box_geom_name="middle_box_geom"):
     return False
 
 def check_gripper_box_contact_right(model, data, box_geom_name="middle_box_geom"):
-    # Both fingers, mirroring check_gripper_box_contact above. The right-finger
-    # names were previously listed twice and the left-finger ones omitted, so a
-    # box seated against arm B's LEFT finger was held but never detected: grip_b
-    # waits on this predicate with no timeout, so those episodes froze mid-
-    # handover until max_steps. It cost 31/200 episodes in the first v3, all of
-    # them spawns in x ~ [-0.01, +0.04] -- exactly where RIGHT_TARGET_OFFSET
-    # (+0.03 in x) seats the box against the unlisted finger.
+    # Both finger pads.
     finger_geom_names = {"right/left_g0", "right/left_g1", "right/left_g2",
                           "right/right_g0", "right/right_g1", "right/right_g2"}
     box_geom_id = model.geom(box_geom_name).id
@@ -87,7 +81,7 @@ def setup_dual_arm_ik(xml_path):
     ]
 
     all_joint_names = left_joint_names + right_joint_names
-    velocity_limits = {name: 1.0 for name in all_joint_names}  # radians/sec, tune this number
+    velocity_limits = {name: 1.0 for name in all_joint_names}  # rad/s
     limits = [mink.VelocityLimit(model, velocity_limits)]
 
     left_dof_ids = np.array([model.joint(name).id for name in left_joint_names])
@@ -106,7 +100,7 @@ def setup_dual_arm_ik(xml_path):
     left_subtree_id = model.body("left/base_link").id
     right_subtree_id = model.body("right/base_link").id
 
-    # --- newly added: task-specific constants, previously hardcoded in the main script ---
+    # Task constants.
     GRASP_ORIENTATION_MATRIX = np.array([
         [ 0.217446,  0.0,        0.976072],
         [ 0.0,       1.0,        0.0     ],

@@ -1,8 +1,6 @@
 """Per-run loss curve, written into the checkpoint folder next to the weights.
 
-Shared by finetune_octo_arm.py (live, during training) and
-plot_loss_curves.py (backfill, from PBS logs) so a curve recovered from a log
-is drawn by exactly the same code as one written by the run itself.
+Used by finetune_octo.py during training.
 """
 
 import json
@@ -32,11 +30,9 @@ def _title(save_dir, meta):
 
 
 def write_history(history, save_dir, meta=None):
-    """Persist training_history.json + loss_curve.png inside save_dir.
+    """Save training_history.json and loss_curve.png in save_dir.
 
-    Called after every validation readout rather than only at the end, so a run
-    killed by walltime, OOM or qdel still leaves a usable curve behind --
-    several runs in this project died partway and left nothing but log lines.
+    Called after every validation, so an interrupted run still leaves a curve.
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)

@@ -1,17 +1,11 @@
-"""Decentralised finetuned pi0.5 on the HIDDEN-MARKER handover, CoLA's harness.
+"""Decentralised pi0.5 baseline on the hidden-marker handover (no channel).
 
-The baseline row for CoLA-on-pi0.5: TWO independently LoRA-finetuned pi0.5
-policies, one per arm, each trained on its own arm only (train_cola_pi05.py
---arm a / --arm b) and each acting from its own wrist camera and joint state.
-Nothing passes between them, so arm B never learns the marker colour and
-correct-tray given a completed handover should sit near chance (33.3%) unless
-A's behaviour leaks it.
+Two independently LoRA-finetuned pi0.5 policies (train_cola_pi05_lora.py --arm a /
+--arm b), each acting from its own wrist camera and joint state. Reset,
+success criterion and summary are CoLA's evaluator code (check_criterion()
+verifies).
 
-Generated from eval_cola_pi05_marker.py, which came from eval_octo_marker.py
-and CoLA's own cola_eval_marker.py: the reset, criterion, scoring loop,
-per-colour breakdown and summary are CoLA's code, verified by check_criterion().
-
-Runs in venv-openpi with MuJoCo 3.12.0 from /scratch/users/ntu/ahaskar0/pi05_eval_site.
+Runs in the openpi environment with MuJoCo 3.12.0 (as used for CoLA's evals).
 """
 import argparse
 import json
@@ -27,29 +21,29 @@ import mujoco
 import numpy as np
 from tqdm import tqdm
 
-COLA_EVAL_DIR = '/home/users/ntu/ahaskar0/CoLA/training/handover_2arm_marker'
-sys.path.insert(0, COLA_EVAL_DIR)
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / 'eval'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# cola_eval_marker imports cola_architecture, which imports Octo (not in this
-# venv). The harness only takes CHUNK_SIZE from it; stub that, verified against
-# CoLA's own source so the control cadence cannot silently differ.
+# eval_marker imports cola.model, which needs Octo (absent here).
+# Only CHUNK_SIZE is used, so stub it, reading the value from CoLA's source.
 import re                                                  # noqa: E402
 import types                                               # noqa: E402
-_COLA_ARCH = '/scratch/users/ntu/ahaskar0/v1/cola-research-code/handover/cola/cola_architecture.py'
-_stub = types.ModuleType('cola_architecture')
+_COLA_ARCH = REPO / 'cola' / 'model.py'
+_stub = types.ModuleType('cola.model')
 _stub.CHUNK_SIZE = int(re.search(r'^CHUNK_SIZE = (\d+)', Path(_COLA_ARCH).read_text(), re.M).group(1))
 _stub.COLAModel = None
-sys.modules['cola_architecture'] = _stub
+sys.modules['cola.model'] = _stub
 
-from cola_eval_marker import (                             # noqa: E402
+from eval_marker import (                                  # noqa: E402
     CHUNK_SIZE, CONTROL_DECIMATION, GRIPPER_OPEN, GRIPPER_OPEN_FRAC, HOLD_STEPS,
     LIFT_Z, MARKER_COLORS, SCENE_XML, SETTLE_STEPS, TRAY_RADIUS, TRAY_Z_MAX,
     apply_action, build_scene, compensate_gravity, reset_episode, touching_box,
     which_tray)
-from cola_eval_marker import CACHE_DIR, GRIPPER_CLOSED, read_state   # noqa: E402
+from eval_marker import CACHE_DIR, GRIPPER_CLOSED, read_state        # noqa: E402
 
-COLA_SOURCE = '/home/users/ntu/ahaskar0/CoLA/training/handover_2arm_marker/cola_eval_marker.py'
+COLA_SOURCE = str(REPO / 'eval' / 'eval_marker.py')
+RESULTS_DIR = REPO / 'results' / 'pi05_decentralised'
 # Markers are assembled so this file's own copies of them do not match first.
 _SCORE_START = ' ' * 12 + 'for k in range(' + 'CHUNK_SIZE):'
 _SCORE_END = ' ' * 4 + 'renderer.' + 'close()'
@@ -70,18 +64,13 @@ def check_criterion():
                        ('summary', _SUM_START, _SUM_END)):
         if _block(cola, s, e) != _block(mine, s, e):
             raise SystemExit(f'{name} differs from {COLA_SOURCE} -- regenerate '
-                             f'eval_cola_pi05_marker.py before trusting a number from it')
+                             f'eval_pi05_decentralised.py before trusting a number from it')
     print("   criterion: identical to CoLA's evaluator (scoring loop + summary)")
 
 
 def merge(shards, results_path):
     """Pool sharded runs and rerun the summary over all their episodes."""
-    # Keep each shard WITH its own path. Sorting the paths separately and
-    # zipping them against offset-sorted data pairs lexicographic order against
-    # numeric order, so results_shard100.json gets recorded as seed_offset 25
-    # once there are more than two shards. The pooled episodes were always
-    # right -- they come from the sorted data -- but the provenance list lied,
-    # and with per-seed offsets there are far more shards to mislabel.
+    # Keep each shard with its own path, sorted by seed offset.
     parts = sorted(((p, json.load(open(p))) for p in shards),
                    key=lambda pr: pr[1]['seed_offset'])
     merged = {k: v for k, v in parts[0][1].items()
@@ -104,14 +93,13 @@ class DecentPi05Policy:
     """One arm's independently finetuned pi0.5 policy. No channel, no partner input."""
 
     def __init__(self, run_dir, arm, seed=0):
-        os.environ.setdefault('OPENPI_DATA_HOME', '/scratch/users/ntu/ahaskar0/openpi_cache')
         import flax.nnx as nnx
         import jax
         import openpi.models.model as _model
         import openpi.models.tokenizer as _tokenizer
-        import cola_pi05_model as C
-        import pi05_marker_data as D
-        import train_cola_pi05 as T
+        import cola_pi05_lora as C
+        import pi05_data as D
+        import train_cola_pi05_lora as T
 
         run = Path(run_dir)
         if (run / 'resume_state').exists() or not (run / 'final_params').exists():
@@ -165,8 +153,7 @@ def _normalize_load(path):
 
 
 def check_cameras(scene_xml=SCENE_XML):
-    """baselines/octo_small/scripts/check_marker_cameras.py, for the wrist views this
-    policy reads, under this process's MuJoCo."""
+    """Check that the scene's wrist cameras reproduce the cached training frames."""
     import h5py
     scene = build_scene(scene_xml)
     r = mujoco.Renderer(scene['model'], 256, 256)
@@ -194,8 +181,8 @@ def check_cameras(scene_xml=SCENE_XML):
 
 def evaluate_pi05_decent_marker(run_a, run_b, n_episodes=150,
                          scene_xml=SCENE_XML, save_videos=True,
-                         video_dir='evaluation_videos_cola_pi05_marker',
-                         results_path='logs/cola_pi05_eval_marker_results.json',
+                         video_dir=str(RESULTS_DIR / 'videos'),
+                         results_path=str(RESULTS_DIR / 'results.json'),
                          max_control_steps=400, video_camera='side_cam',
                          seed_offset=0, seed=0):
 
@@ -212,7 +199,7 @@ def evaluate_pi05_decent_marker(run_a, run_b, n_episodes=150,
     print('\n1. Loading two independent pi0.5 policies (no channel)...')
     policy_a = DecentPi05Policy(run_a, 'a', seed=seed + seed_offset)
     policy_b = DecentPi05Policy(run_b, 'b', seed=seed + seed_offset + 1)
-    # Names the results dict below records, kept so that block stays CoLA's.
+    # Recorded in results, as in CoLA's evaluator.
     use_messages = False
     use_overhead = False
     print('   messages: none -- two independent policies | cameras: wrist only')
@@ -242,10 +229,10 @@ def evaluate_pi05_decent_marker(run_a, run_b, n_episodes=150,
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep in tqdm(range(n_episodes), desc='Evaluating'):
-        # Same cycling the collection used, so the eval is colour-balanced by
-        # construction: 150 episodes is exactly 50/50/50.
+        # Colours cycle with the episode index, so the eval is balanced.
         color = MARKER_COLORS[(seed_offset + ep) % len(MARKER_COLORS)]
         reset_episode(scene, scene_xml, color)
+        donor_color = None  # no message swap here; kept so results match eval_marker.py
 
         frames = []
         transfer_done = False
@@ -255,9 +242,8 @@ def evaluate_pi05_decent_marker(run_a, run_b, n_episodes=150,
         control_step = 0
 
         while control_step < max_control_steps and landed is None:
-            # Each arm renders its own wrist camera and reads its own state;
-            # the 64-d message is the only thing that crosses. act_both returns
-            # CHUNK_SIZE absolute joint targets plus the gripper endpoint.
+            # Each arm uses its own wrist camera and state; nothing is shared.
+            # act() returns CHUNK_SIZE actions in actuator units.
             chunk_a = policy_a.act(scene, renderer, 'wrist_cam_left')
             chunk_b = policy_b.act(scene, renderer, 'wrist_cam_right')
 
@@ -287,9 +273,7 @@ def evaluate_pi05_decent_marker(run_a, run_b, n_episodes=150,
                     if transfer_run >= HOLD_STEPS:
                         transfer_done = True
                 else:
-                    # Require the box to REST in a tray for a few steps, so a
-                    # box passing through the region on its way elsewhere does
-                    # not score.
+                    # The box must rest in a tray for SETTLE_STEPS to count.
                     tray = which_tray(box)
                     if tray is not None and not b_holds:
                         settle_run += 1
@@ -321,6 +305,7 @@ def evaluate_pi05_decent_marker(run_a, run_b, n_episodes=150,
         results['episodes'].append({
             'episode': ep, 'marker_color': color, 'landed_tray': landed,
             'correct': bool(correct), 'transfer_done': bool(transfer_done),
+            'donor_color': donor_color,
             'control_steps': control_step,
             'final_box_pos': [float(v) for v in box],
         })
@@ -338,14 +323,11 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
     n_tray = sum(e['landed_tray'] is not None for e in eps)
     n_xfer = sum(e['transfer_done'] for e in eps)
 
-    # Per-colour, because a policy that always picks one tray scores ~33%
-    # overall and looks like partial information. The per-colour split exposes
-    # that: a constant policy is 100/0/0, real information is balanced.
+    # Per-colour breakdown: a policy that always picks one tray shows up here.
     by_color = {}
     for c in MARKER_COLORS:
         sub = [e for e in eps if e['marker_color'] == c]
-        # Conditioned on transfer for the same reason as the headline: an
-        # episode that never handed the box over says nothing about routing.
+        # Conditioned on a completed handover, like the headline.
         sub_x = [e for e in sub if e['transfer_done']]
         by_color[c] = {
             'n': len(sub),
@@ -356,28 +338,21 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
                       for t in MARKER_COLORS + [None]},
         }
 
-    # Correct answers among episodes where the handover actually completed.
-    # THIS IS THE HEADLINE NUMBER. A policy cannot route a box it never
-    # received, so raw correct_rate conflates two unrelated abilities:
-    # manipulation (can B take the box?) and routing (does B know where it
-    # goes?). Only the second is about communication. The no-messages control
-    # made this concrete -- it failed the physical handover in 93% of episodes,
-    # so its raw 1.5% mostly measured a broken grasp, not a missing colour.
+    # Headline: correct tray among completed handovers, which separates
+    # routing (communication) from manipulation.
     n_correct_xfer = sum(e['correct'] for e in eps if e['transfer_done'])
     correct_given_xfer = (100.0 * n_correct_xfer / n_xfer) if n_xfer else None
 
     results['summary'] = {
         'n_episodes': n,
-        # Report this FIRST: correct tray among completed handovers.
+        # Headline metric.
         'correct_given_transfer': correct_given_xfer,
         'n_transfers': n_xfer,
         'n_correct_given_transfer': n_correct_xfer,
         'correct_rate': 100.0 * n_correct / n,
         'tray_rate': 100.0 * n_tray / n,
         'transfer_rate': 100.0 * n_xfer / n,
-        # Narrower still: of the times B placed the box ANYWHERE, how often was
-        # it the right tray? Differs from correct_given_transfer only by the
-        # episodes that transferred but never reached a tray.
+        # Correct among episodes that reached any tray.
         'correct_given_tray': (100.0 * n_correct / n_tray) if n_tray else None,
         'chance_rate': 100.0 / len(MARKER_COLORS),
         'by_color': by_color,
@@ -435,7 +410,7 @@ if __name__ == '__main__':
     p.add_argument('--episodes', type=int, default=150)
     p.add_argument('--scene-xml', default=SCENE_XML)
     p.add_argument('--no-videos', action='store_true')
-    p.add_argument('--video-dir', default='evaluation_videos_pi05_decent_marker')
+    p.add_argument('--video-dir', default=str(RESULTS_DIR / 'videos'))
     p.add_argument('--results-path', required=True)
     p.add_argument('--max-control-steps', type=int, default=400)
     p.add_argument('--camera', default='side_cam')

@@ -1,19 +1,10 @@
 <!--
-  aloha.xml with the WRIST CAMERA FOV AT ITS ORIGINAL VALUE (focal 1.93e-3,
-  fovy 58.0 deg), not the widened 1.2e-3 / 83.4 deg now in aloha.xml.
-
-  Why this file exists: every cached demo image and every extracted feature
-  under cache_aloha_handover/ and features_aloha_handover/ was rendered at
-  58.0 deg. Rolling out against the widened camera shows the policy a visual
-  distribution it never trained on. Rather than re-collecting 118 episodes,
-  training and evaluation both point at this file so the seam closes.
-
-  Generated from aloha.xml; the ONLY difference is the wrist camera focal
-  length on wrist_cam_left and wrist_cam_right. overhead_cam lives in
-  scene.xml and was never changed.
+  aloha.xml with the wrist cameras at their original 58-degree FOV (focal
+  1.93e-3), which the cached demos were rendered with; aloha.xml was later
+  widened. This is the only difference.
 -->
 <mujoco model="aloha">
-  <compiler angle="radian" meshdir="assets" autolimits="true"/>
+  <compiler angle="radian" meshdir="../assets" autolimits="true"/>
 
   <option cone="elliptic" impratio="10"/>
 

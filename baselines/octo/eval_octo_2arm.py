@@ -1,25 +1,11 @@
-"""Roll out two DECENTRALISED finetuned Octo policies on the ALOHA handover.
+"""Roll out finetuned Octo policies on the ALOHA handover.
 
-One policy per arm, each finetuned by finetune_octo_arm.py. Each sees ONLY its
-own wrist camera and its own joint state, and there is no channel between them:
-the only thing telling them apart is the language instruction each was trained
-with. That is the comparison CoLA is about.
+Decentralised: one policy per arm (from finetune_octo.py), each with only
+its own wrist camera and joint state and no channel. Centralised
+(--centralised): one 14-d policy for both arms. Policies emit absolute joint
+targets, written straight to ctrl; scene, seeds and criteria come from eval_octo_zeroshot.
 
-Why this is a separate script from eval_octo.py: a finetuned policy emits
-ABSOLUTE JOINT POSITIONS, exactly the 7-d vector collect_demos.py recorded as
-action_a. So the entire delta-EE bridge in eval_octo.py -- mink IK, cumulative
-delta integration, GRASP_ORIENTATION pinning, base-frame rotation, action_scale
--- is not merely retuned but deleted. Actions go straight to data.ctrl, which is
-where the scripted expert put them. Scoring, scene, seeds and criteria are
-imported from eval_octo so the rows stay comparable.
-
-Proprio is built to match state_a in scripted_policy.py exactly:
-    concat(qpos[6 arm joints], [qpos[left_finger]])
-and normalized with the checkpoint's own dataset_statistics.
-
-    python eval_octo_finetuned.py \
-        --checkpoint-a /scratch/.../octo_finetune/arm_a \
-        --checkpoint-b /scratch/.../octo_finetune/arm_b \
+    python eval_octo_2arm.py --checkpoint-a CKPT_A --checkpoint-b CKPT_B \\
         --episodes 50 --criterion hold
 """
 
@@ -29,15 +15,13 @@ from pathlib import Path
 
 import numpy as np
 
-import eval_octo as E
+import eval_octo_zeroshot as E
 
 
 class FinetunedOctoPolicy:
-    """One finetuned Octo driving one arm, in absolute joint space.
+    """One finetuned Octo policy driving one arm in absolute joint space.
 
-    Exposes the same surface as eval_octo.OctoPolicy (reset/act/diagnostics plus
-    camera/instruction/action_scale/stats_name) so eval_octo.evaluate can drive
-    it unchanged.
+    Same interface as eval_octo_zeroshot.OctoPolicy, so eval_octo_zeroshot.evaluate can drive it.
     """
 
     def __init__(self, checkpoint_dir, camera=None, instruction=None, step=None,
@@ -51,15 +35,13 @@ class FinetunedOctoPolicy:
         if (ckpt / 'finetune_meta.json').exists():
             meta = json.load(open(ckpt / 'finetune_meta.json'))
 
-        # A run split across queue jobs leaves resume_state.npz until its last
-        # segment finishes; evaluating before then scores a half-trained model.
+        # resume_state.npz means training hasn't finished.
         if (ckpt / 'resume_state.npz').exists():
             raise SystemExit(f'{ckpt} is mid-training (resume_state.npz present)')
         print(f'   loading finetuned {ckpt}' + (f' @ step {step}' if step else ''))
         self.model = OctoModel.load_pretrained(str(ckpt), step=step)
 
-        # Single-dataset finetune, so statistics are flat rather than keyed by
-        # source dataset. These are OUR ALOHA statistics, not Bridge's.
+        # Single-dataset finetune: statistics are not keyed by dataset.
         stats = self.model.dataset_statistics
         assert 'action' in stats, (
             f'{ckpt} has per-dataset statistics {sorted(stats)}; this script '
@@ -72,35 +54,24 @@ class FinetunedOctoPolicy:
 
         self.instruction = instruction or meta.get('instruction', '')
         self.task = self.model.create_tasks(texts=[self.instruction])
-        # Render the SAME view the policy trained on. Taking this from the
-        # checkpoint's own metadata makes a train/eval camera mismatch
-        # impossible to introduce by forgetting a flag.
+        # Render the camera recorded in the checkpoint's metadata.
         self.meta = meta
         self.camera = camera or meta.get('camera')
-        # Second camera, when the checkpoint was trained with two. Taken from
-        # the checkpoint so train and eval cannot disagree about the view.
+        # Second camera, if the checkpoint was trained with one.
         self.wrist_camera = meta.get('wrist_camera')
         assert self.camera, (
             f'{ckpt} has no camera in finetune_meta.json; pass --camera-a/-b')
         self.use_proprio = bool(meta.get('use_proprio', True))
         self.window = int(meta.get('window_size', 1))
         self.horizon = int(meta.get('action_horizon', 50))
-        # A head shorter than CHUNK_SIZE (octo's native 4) returns a shorter
-        # chunk; eval_octo's loop executes only what was predicted and
-        # re-queries, so the policy replans more often than CoLA's 10.
+        # A horizon shorter than CHUNK_SIZE means the policy replans more often.
         self.exec_steps = min(self.horizon, E.CHUNK_SIZE)
         self.rng = jax.random.PRNGKey(seed)
 
-        # Present for interface compatibility only; there is no scale in an
-        # absolute joint action space.
+        # Interface compatibility only (absolute joint actions have no scale).
         self.action_scale = 1.0
         self.stats_name = 'finetune'
-        # The expert only ever commanded two gripper values (0.002 / 0.037).
-        # Anything between is a command the robot never saw in training and
-        # leaves the hand half-closed -- able neither to envelop the box nor
-        # to grip it. Snapping to the nearer of the two is faithful to the
-        # demonstrated action space. Off by default so the raw policy output
-        # stays measurable.
+        # Optionally snap the gripper to the two demonstrated values (0.002 / 0.037).
         self.gripper_snap = gripper_snap
 
         self.grip_values = []
@@ -143,18 +114,11 @@ class FinetunedOctoPolicy:
             obs, self.task, unnormalization_statistics=self.action_stats, rng=sub)
         actions = np.asarray(actions)[0]              # (horizon, 7)
 
-        # Receding horizon: predict the full chunk, execute only the first
-        # CHUNK_SIZE, then re-observe. Matches octo's RHCWrapper and keeps the
-        # control cadence identical to CoLA's.
-        # np.array (not asarray): asarray on a JAX array returns a
-        # READ-ONLY view, and --gripper-snap writes into this.
+        # Receding horizon: execute the first CHUNK_SIZE actions, then re-observe.
+        # np.array, not asarray: --gripper-snap writes into this.
         chunk = np.array(actions[:E.CHUNK_SIZE], dtype=np.float32)
 
-        # Every EXECUTED step, not just the chunk's last action. Sampling
-        # only chunk[-1] mixes two different populations and made a bimodal
-        # gripper look like a flat one.
-        # Record the RAW prediction before any snapping, so the diagnostic
-        # still reports what the policy actually produced.
+        # Record the raw gripper command of every executed step.
         self.grip_values.extend(chunk[:, 6].tolist())
         if self.gripper_snap:
             mid = (E.GRIPPER_OPEN + E.GRIPPER_CLOSED) / 2
@@ -167,9 +131,7 @@ class FinetunedOctoPolicy:
         return chunk
 
     def diagnostics(self):
-        # Deliberately empty: eval_octo's printout is written for the delta-EE
-        # bridge and its keys are meaningless here. Real numbers come from
-        # joint_diagnostics() below.
+        # Empty: eval_octo_zeroshot's printout doesn't apply here; see joint_diagnostics().
         return {}
 
     def joint_diagnostics(self):
@@ -178,8 +140,7 @@ class FinetunedOctoPolicy:
         g = np.asarray(self.grip_values)
         mid = (E.GRIPPER_OPEN + E.GRIPPER_CLOSED) / 2
         gc = np.asarray(self.grip_chunk_values) > mid
-        # Percentiles expose the shape: a bimodal command sits near 0.002 and
-        # 0.037 with little between, a hedging one clusters at the mean.
+        # Percentiles show whether the gripper command is bimodal or hedging.
         return {
             'gripper_cmd_mean': float(g.mean()),
             'gripper_frac_open': float((g > mid).mean()),
@@ -195,21 +156,11 @@ class FinetunedOctoPolicy:
 
 
 class CentralisedOctoPolicy(FinetunedOctoPolicy):
-    """One policy emitting a 14-d bimanual action for BOTH arms.
+    """One policy emitting a 14-d action for both arms (the centralised variant).
 
-    This is octo's own ALOHA recipe (examples/02_finetune_new_observation_action.py):
-    a single third-person camera, proprio over both arms, and one L1ActionHead
-    with action_dim=14. It is the CENTRALISED upper bound -- one policy sees
-    everything and commands everything, with no decentralisation and therefore
-    no coordination problem to solve.
-
-    eval_octo.evaluate drives two arms by calling act() once per arm per chunk,
-    always arm A first. So the 14-d chunk is computed on the A call and the B
-    call is served from that same forward pass; querying twice would consume two
-    observations for one decision and double the diagnostics.
-
-    Column order follows ARM_SPEC['both'] -- (action_a, action_b) -- so 0:7 is
-    arm A and 7:14 is arm B. That ordering must not drift from the data module.
+    eval_octo_zeroshot.evaluate calls act() for arm A, then arm B, each chunk; the A call
+    runs the model and the B call reuses its output. Columns 0:7 are arm A and
+    7:14 arm B (ARM_SPEC['both']).
     """
 
     def _proprio_both(self, scene):
@@ -257,16 +208,16 @@ class CentralisedOctoPolicy(FinetunedOctoPolicy):
         return self._chunk14[:, lo:lo + 7]
 
 
-# Which wrist FOV each demo cache was rendered at, measured by rendering a
-# reconstructed frame at both candidates and comparing to the stored image
-# (check_wrist_fov.py). The overhead camera is 1.93e-3 in every scene variant,
-# so only wrist-camera checkpoints care -- but for those a mismatch trains on
-# one lens and evaluates on another, which looks like a failed ablation rather
-# than a bug.
+# Wrist-camera FOV each demo cache was rendered with; eval must use the same one.
+# The first three are the caches behind the paper's checkpoints; the rest are
+# the default cache names (demos collected with the current scenes).
 CACHE_WRIST_FOV = {
     'cache_aloha_handover_v2': 58.01,
     'cache_fulltask_v5': 83.44,
     'cache_handover_only_v1': 83.44,
+    'handover_2arm': 83.44,
+    'handover_2arm_fulltask': 83.44,
+    'handover_marker': 83.44,
 }
 
 
@@ -312,14 +263,13 @@ def main():
     p.add_argument('--instruction-b', default=None)
     p.add_argument('--episodes', type=int, default=50)
     p.add_argument('--criterion', choices=E.CRITERIA, default='hold',
-                   help="defaults to hold, matching cola_eval_aloha.py")
+                   help="defaults to hold, matching eval_2arm.py")
     p.add_argument('--handover-only', action='store_true')
     p.add_argument('--scene-xml', default=E.SCENE_XML)
     p.add_argument('--max-control-steps', type=int, default=350)
     p.add_argument('--no-videos', action='store_true')
-    p.add_argument('--video-dir', default='experiments/octo_baseline/videos/ft')
-    p.add_argument('--results-path',
-                   default='experiments/octo_baseline/logs/octo_ft_decentralised.json')
+    p.add_argument('--video-dir', default=str(E.REPO / 'results' / 'octo_2arm' / 'videos'))
+    p.add_argument('--results-path', default=str(E.REPO / 'results' / 'octo_2arm' / 'results.json'))
     p.add_argument('--centralised', action='store_true',
                    help='--checkpoint-a is a single 14-d bimanual policy that '
                         'drives BOTH arms (octo ALOHA reference recipe)')
@@ -329,12 +279,13 @@ def main():
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--seed-offset', type=int, default=0,
                    help='shift the per-episode seeds by this amount, exactly '
-                        'as cola_eval_aloha.py --seed-offset does. Episodes '
+                        'as eval_2arm.py --seed-offset does. Episodes '
                         'are seeded seed_offset + ep_idx, so 0/1000/2000/... '
                         'are independent 200-episode draws of the same policy '
                         'and their spread is the run-to-run variance. Distinct '
                         "from --seed, which seeds the policy's sampling only.")
     args = p.parse_args()
+    E.check_criterion()
 
     print('=' * 62)
     print('DECENTRALISED FINETUNED OCTO  (two policies, no comms channel)')

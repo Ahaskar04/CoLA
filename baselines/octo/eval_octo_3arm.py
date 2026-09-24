@@ -1,15 +1,9 @@
-"""Octo baseline on the 3-arm A->B->C handover, through CoLA's own harness.
+"""Octo baseline on the three-arm A -> B -> C handover, scored by CoLA's harness.
 
-Generated from /home/users/ntu/ahaskar0/CoLA/training/handover_3arm/cola_eval_3arm_handover.py
-by replacing only the two model-specific blocks -- loading the policy and the
-per-chunk forward pass. The handover-only reset, the A->B / B->C / hold
-criterion, drop detection, video labels and summary are CoLA's code unchanged,
-so an Octo number and a CoLA number are scored identically. check_criterion()
-re-verifies that at start-up and refuses to run if CoLA's evaluator has since
-changed.
-
-Three decentralised policies, one per arm, each seeing the overhead camera and
-its own proprioception, with no channel between them.
+Only policy loading and the forward pass differ from eval/eval_3arm.py.
+Reset, criterion, drop detection and summary are CoLA's code, and
+check_criterion() refuses to run if they have drifted. Runs three independent
+per-arm policies (overhead camera + own proprio) with no channel.
 """
 
 import argparse
@@ -23,24 +17,24 @@ import mujoco
 import numpy as np
 from tqdm import tqdm
 
-COLA_EVAL_DIR = '/home/users/ntu/ahaskar0/CoLA/training/handover_3arm'
-sys.path.insert(0, COLA_EVAL_DIR)
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / 'eval'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import cola_eval_3arm_handover as H                       # noqa: E402
-from cola_eval_3arm_handover import (                     # noqa: E402
+import eval_3arm as H                                     # noqa: E402
+from eval_3arm import (                                   # noqa: E402
     ARMS, CHUNK_SIZE, CONTROL_DECIMATION, CRITERIA, DROP_STEPS, GRIPPER_OPEN,
     GRIPPER_OPEN_FRAC, HOLD_STEPS, LIFT_Z, SCENE_XML, CACHE_DIR, SETTLE_STEPS,
     VIDEO_CAMERA, apply_action, build_scene, compensate_gravity,
     reset_episode_handover, touching_box)
-import eval_octo as E                                     # noqa: E402
-from eval_octo_finetuned import FinetunedOctoPolicy       # noqa: E402
+import eval_octo_zeroshot as E                            # noqa: E402
+from eval_octo_2arm import FinetunedOctoPolicy            # noqa: E402
 
-COLA_SOURCE = '/home/users/ntu/ahaskar0/CoLA/training/handover_3arm/cola_eval_3arm_handover.py'
+COLA_SOURCE = str(REPO / 'eval' / 'eval_3arm.py')
+RESULTS_DIR = REPO / 'results' / 'octo_3arm'
 
 
-# Markers are assembled rather than written out: spelled literally they would
-# appear in this function's own source and the search would start here.
+# Markers are assembled so this file's own copies of them do not match first.
 _START = ' ' * 12 + 'for k in range(' + 'CHUNK_SIZE):'
 _END = ' ' * 4 + 'renderer.' + 'close()\n\n' + ' ' * 4 + "scored = len(results['episodes'])"
 
@@ -69,8 +63,8 @@ def evaluate_octo_3arm(
     scene_xml: str = SCENE_XML,
     cache_dir: str = CACHE_DIR,
     save_videos: bool = True,
-    video_dir: str = 'evaluation_videos_3arm',
-    results_path: str = 'logs/cola_eval_3arm_results.json',
+    video_dir: str = str(RESULTS_DIR / 'videos'),
+    results_path: str = str(RESULTS_DIR / 'results.json'),
     max_control_steps: int = 600,
     use_messages: bool = True,
     video_camera: str = VIDEO_CAMERA,
@@ -100,8 +94,7 @@ def evaluate_octo_3arm(
         videos_dir.mkdir(parents=True, exist_ok=True)
 
     print('\n1. Loading Octo policies (one per arm, no channel)...')
-    # Same convention CoLA reads: absolute joint targets unless the cache says
-    # velocity. Octo learned whatever the cache holds, so this stays in sync.
+    # Octo learned whatever the cache holds: absolute targets unless it says velocity.
     with open(Path(cache_dir) / 'action_stats.json') as _f:
         velocity_actions = bool(json.load(_f).get('velocity', False))
     if velocity_actions:
@@ -144,8 +137,7 @@ def evaluate_octo_3arm(
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep_idx in tqdm(range(n_episodes), desc='Evaluating'):
-        # A start state the grasp did not survive is not a policy failure; skip
-        # rather than score an episode that began with an empty hand.
+        # Skip episodes whose start-state grasp failed.
         if not reset_episode_handover(scene, seed_offset + ep_idx, scene_xml):
             print(f'  ep {ep_idx}: skipped (grasp lost building start state)')
             results['skipped'] += 1
@@ -173,11 +165,8 @@ def evaluate_octo_3arm(
         max_bc_run = 0
 
         while control_step < max_control_steps and not success and not dropped:
-            # Three independent Octo policies. Each renders the shared
-            # overhead view and reads only its own proprio; nothing passes
-            # between them. act() returns CHUNK_SIZE absolute joint targets
-            # plus the gripper command in actuator units -- exactly what
-            # apply_action writes to ctrl, so no denormalise or logit step.
+            # Three independent policies, each with the overhead view and its own
+            # proprio. act() returns CHUNK_SIZE actions in actuator units.
             chunks = {a: policies[a].act(scene, renderer, scene['arms'][a])
                       for a in ARMS}
 
@@ -188,12 +177,8 @@ def evaluate_octo_3arm(
                 for a in ARMS:
                     step = chunks[a][k].copy()
                     if velocity_actions:
-                        # A velocity cache stores per-step joint DELTAS. Written
-                        # straight to ctrl they command "go to 0.03 rad from the
-                        # origin" instead of "move 0.03 from here". Read qpos
-                        # fresh each step rather than accumulating onto the
-                        # previous command, which would let the target drift
-                        # away from the arm whenever the servo lags.
+                        # Velocity actions are deltas: add them to the current
+                        # joint positions, read fresh each step.
                         step[:6] = data.qpos[scene['arms'][a]['qadr']] + step[:6]
                     apply_action(data, scene['arms'][a], step)
 
@@ -216,7 +201,7 @@ def evaluate_octo_3arm(
                 max_box_z = max(max_box_z, box_z)
 
                 if not ab_done:
-                    # ---- Link 1: A -> B ----------------------------------
+                    # Link 1: A -> B
                     if holds['b'] and box_z > LIFT_Z and not holds['a'] and is_open['a']:
                         ab_run += 1
                     else:
@@ -230,10 +215,8 @@ def evaluate_octo_3arm(
                             success = True
 
                 elif not bc_done:
-                    # ---- Link 2: B -> C ----------------------------------
-                    # B must keep the box until C takes it. Key the drop test on
-                    # CONTACT, not height: B turns 180 degrees carrying the box
-                    # and may dip below LIFT_Z on the way round.
+                    # Link 2: B -> C
+                    # The drop test keys on contact: B may dip below LIFT_Z while turning.
                     if not holds['b'] and not holds['c']:
                         no_contact_run += 1
                         if no_contact_run >= DROP_STEPS:
@@ -255,7 +238,7 @@ def evaluate_octo_3arm(
                         if criterion == 'transfer':
                             success = True
                 else:
-                    # ---- Phase 3: C keeps it -----------------------------
+                    # Phase 3: C keeps it
                     no_contact_run = 0 if holds['c'] else no_contact_run + 1
                     if no_contact_run >= DROP_STEPS:
                         dropped = True
@@ -329,8 +312,7 @@ def evaluate_octo_3arm(
         'success_rate': 100.0 * results['task_successes'] / scored,
         'ab_rate': 100.0 * results['ab_count'] / scored,
         'bc_rate': 100.0 * results['bc_count'] / scored,
-        # Of the episodes that cleared A->B, how many went on to clear B->C.
-        # This is the number that says whether the SECOND link is the bottleneck.
+        # Fraction of A->B successes that also cleared B->C.
         'bc_given_ab': (100.0 * results['bc_count'] / len(ab_eps)) if ab_eps else None,
         'drop_rate': 100.0 * results['drop_count'] / scored,
         'b_touch_rate': 100.0 * results['b_touched_count'] / scored,
@@ -356,9 +338,8 @@ def evaluate_octo_3arm(
     if results['skipped']:
         print(f"  Skipped starts:   {results['skipped']} (grasp lost at reset, not scored)")
     print(f"Mean control steps: {s['mean_control_steps']:.1f}")
-    # If either of these sits near max_control_steps there is no room left for
-    # the next phase -- raise --max-control-steps rather than reading the
-    # success rate as a policy failure.
+    # If these approach max_control_steps, raise --max-control-steps before
+    # reading failures as policy failures.
     if s['mean_ab_step'] is not None:
         print(f"Mean A->B step:     {s['mean_ab_step']:.1f} / {max_control_steps}")
     if s['mean_bc_step'] is not None:
@@ -385,7 +366,7 @@ if __name__ == '__main__':
     p.add_argument('--no-videos', action='store_true')
     p.add_argument('--seed-offset', type=int, default=0)
     p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--video-dir', default='evaluation_videos_octo_3arm')
+    p.add_argument('--video-dir', default=str(RESULTS_DIR / 'videos'))
     p.add_argument('--results-path', required=True)
     p.add_argument('--max-control-steps', type=int, default=600)
     p.add_argument('--criterion', choices=CRITERIA, default='hold')

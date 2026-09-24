@@ -1,56 +1,13 @@
 #!/usr/bin/env python3
-"""What does CoLA's message encode on the PLAIN HANDOVER task?
+"""Probe what CoLA's message encodes on the plain handover task.
 
-The marker task has a categorical answer -- one of three colours -- and a
-logistic probe reads it out of msg_a at 73.3% over 150 episodes against a
-matched no-message control at exactly 33.3%. Plain handover has no such label:
-nothing discrete distinguishes one episode from another.
-
-What it does have is arm A's PRESENTATION POSE. cola_eval_aloha.py and the
-collection policy draw it per episode as
-
-    offset = [0, uniform(-HO_Y_RANGE, +HO_Y_RANGE),      # +/- 10 cm lateral
-                 uniform(-HO_Z_RANGE, +HO_Z_RANGE)]      # +/- 6 cm vertical
-
-with x deliberately fixed -- the arms always meet at the same point along the
-axis between them. So (y, z) is the ONLY thing that varies between episodes,
-and it is therefore the only thing a message could be carrying about the task.
-
-This probe regresses (y, z) out of msg_a and reports R^2 and an RMSE in
-centimetres, which is interpretable: an RMSE well under the 10 cm / 6 cm draw
-ranges means the message locates A's gripper.
-
-WHY IT MATTERS. Messages are worth ~0.1 points on this task (90.6 +/- 1.7 with,
-90.5 without) yet the failure profiles invert almost completely -- with
-messages B mostly never reaches the box, without them it reaches but cannot
-complete the transfer -- and severing them costs 67% on validation loss in the
-3-arm case. Something is being transmitted and used by the loss without
-changing the outcome. If the answer is "A's end-effector pose", the null has a
-mechanism: B can SEE that once the box enters its wrist view, so the message is
-redundant with vision here, while on the hidden-marker task the relevant
-variable is invisible to B and the same channel is worth 48 points over chance.
-
-LABEL PROVENANCE. The h5 files do not record the offset as an attribute, so it
-is read from box_pos[0] -- the box's position at t=0, while A is still holding
-it at the presentation pose. Verified against the draw ranges: y spans
--0.107..+0.066 and z spans 0.208..0.320 over the first six training episodes,
-consistent with HO_Y_RANGE=0.10 and HO_Z_RANGE=0.06, and x is constant at
--0.28 as the design intends.
-
-THREE PROBES, as in the marker script:
-  self_a  -- the encoder's INPUT. The ceiling: a pose the encoder never saw
-             cannot be transmitted.
-  msg_a   -- the message. The number of interest.
-  msg_a from the NO-MESSAGE checkpoint -- the control. Its encoder still trains
-             but its output is zeroed before the decoder reads it, so it has no
-             gradient pressure to encode anything. On the marker task this
-             control sits at exactly chance; here it should sit at R^2 ~ 0.
-
-Grouped 5-fold CV over all episodes, folds split BY EPISODE. Frames within an
-episode share a label and are highly correlated, so a frame-level split would
-let the probe memorise episodes and report a meaningless R^2 near 1.
-
-CPU only, no rollouts, no SU.
+The only per-episode variable is arm A's presentation offset (y, z), read
+from box_pos at t=0. Ridge regression with grouped 5-fold CV (split by
+episode) predicts it from:
+    self_a   the encoder's input (ceiling)
+    msg_a    the message
+    msg_a    from the no-message checkpoint (control)
+Reports R^2 and RMSE in cm. CPU only.
 """
 
 import argparse
@@ -60,18 +17,16 @@ import sys
 
 import numpy as np
 
-REPO = "/scratch/users/ntu/ahaskar0/v1/cola-research-code"
-sys.path.insert(0, f"{REPO}/handover/cola")
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]
-                      / "handover_2arm_marker"))
+REPO = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from probe_messages import build_messages, load_split, normalise_states  # noqa: E402
+from probe_messages_marker import build_messages, load_split, normalise_states  # noqa: E402
 
-CACHE = "/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_handover_only_v1"
-FEATS = "/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/features_handover_only_v1"
-EXP = f"{REPO}/handover/cola/experiments"
-MSG_CKPT = f"{EXP}/run_handover_only_unet_wristmsg/checkpoints/best_model.pkl"
-NOMSG_CKPT = f"{EXP}/run_handover_only_unet_wristnomsg/checkpoints/best_model.pkl"
+CACHE = str(REPO / "data" / "cache" / "handover_2arm")
+FEATS = str(REPO / "data" / "features" / "handover_2arm")
+MSG_CKPT = str(REPO / "runs" / "handover_2arm_wrist" / "checkpoints" / "best_model.pkl")
+NOMSG_CKPT = str(REPO / "runs" / "handover_2arm_wrist_nomsg" / "checkpoints" / "best_model.pkl")
 
 
 def episode_offsets(cache_dir, split):
@@ -96,15 +51,11 @@ def probe_cv(X, Y, ep, n_folds=5, seed=0):
     pred = np.zeros_like(Y)
     for tr, te in gkf.split(X, Y, groups=ep):
         sc = StandardScaler().fit(X[tr])
-        # RidgeCV picks alpha per fold by internal CV: msg_a is 64-d against
-        # ~18k correlated frames, so an unregularised fit would overfit the
-        # frame count rather than the 120 independent episodes.
+        # RidgeCV picks alpha per fold; frames are highly correlated within episodes.
         m = RidgeCV(alphas=np.logspace(-2, 4, 13)).fit(sc.transform(X[tr]), Y[tr])
         pred[te] = m.predict(sc.transform(X[te]))
 
-    # Per-episode: average the frame predictions within an episode, which is the
-    # quantity that actually has one label. Frame-level R^2 would be dominated
-    # by the longest episodes.
+    # Per-episode R^2: average the frame predictions within each episode.
     eps = np.unique(ep)
     yt = np.stack([Y[ep == e][0] for e in eps])
     yp = np.stack([pred[ep == e].mean(0) for e in eps])

@@ -1,18 +1,15 @@
-# Outputs, not inputs. Everything here is PRODUCED by the pipeline; the repo
-# ships only what is needed to run it.
+# Pipeline outputs: data, caches, checkpoints, videos and logs.
 *.h5
 *.npy
 *.npz
 *.pkl
 *.mp4
-experiments/
+data/
+runs/
 results/
-logs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# NOT ignored, despite being binary: envs/assets/*.stl and *.obj are the ALOHA
-# meshes and envs/*/aloha*.png the textures. MuJoCo loads them by name from the
-# scene XML, so a checkout without them cannot build a scene at all. They are
-# ~16 MB once, shared by all three tasks through a symlink.
+# envs/assets (meshes and textures shared by the three tasks) is tracked on
+# purpose: the scene XMLs load it.

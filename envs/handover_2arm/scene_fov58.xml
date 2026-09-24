@@ -1,12 +1,9 @@
 <!--
-  scene.xml pinned to the original 58.0 deg wrist camera FOV, by including
-  aloha_fov58.xml instead of aloha.xml. See that file for why.
-
-  Use this scene for anything that touches the cached demos: Octo finetuning,
-  Octo evaluation, CoLA feature extraction and CoLA evaluation.
+  scene.xml with aloha_fov58.xml (58-degree wrist cameras), matching the
+  cached demos.
 -->
 <mujoco model="aloha_scene">
-  <compiler meshdir="assets" texturedir="assets"/>
+  <compiler meshdir="../assets" texturedir="../assets"/>
 
   <include file="aloha_fov58.xml"/>
 

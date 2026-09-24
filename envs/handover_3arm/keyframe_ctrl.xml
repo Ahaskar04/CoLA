@@ -1,25 +1,15 @@
 <mujoco>
   <keyframe>
     <!-- Three arms at rest, box on the table.
-         31 qpos, NOT the 2-arm scene's 23: arm C adds 8 DOFs (6 joints + 2
-         fingers) BEFORE the box, so the box freejoint moved from qpos[16:23]
-         to qpos[24:31]. Any code still reading qpos[16:19] for the box position
-         now reads arm C's shoulder and elbow instead, silently.
-         Layout: left 0-7, right 8-15, third 16-23, box 24-30 (xyz + wxyz quat).
-         ctrl is 21 values in actuator order, 7 per arm. -->
+         31 qpos: left 0-7, right 8-15, third 16-23, box 24-30 (xyz + wxyz quat).
+         21 ctrl, 7 per arm. -->
     <key name="neutral_pose"
       qpos="0 -0.96 1.16 0 -0.3 0 0.0084 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084 0.0084 0 0 0.03 1 0 0 0"
       ctrl="0 -0.96 1.16 0 -0.3 0 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084"/>
 
-    <!-- Arm A already gripping the box, B and C at rest: the state a
-         handover-only episode starts from, so the recorded task is the two
-         handover legs with no pick-up.
-         31 qpos / 21 ctrl, NOT the 2-arm scene's 23/14 -- arm C adds 8 DOFs
-         BEFORE the box, so the freejoint sits at qpos[24:31].
-         Built by IK to arm A's own GRASP_ORIENTATION then settled 800 steps
-         under gravity, so this is an equilibrium rather than a hand-computed
-         pose. ALL THREE gripper ctrls are 0.002 (CLOSED): an open value on A
-         springs the fingers and drops the box on step 1. -->
+    <!-- Handover-only start: arm A holds the box at GRASP_ORIENTATION, B and C
+         at rest. Built by IK, then settled 800 steps. All gripper ctrls are
+         0.002 (closed). 31 qpos / 21 ctrl. -->
     <key name="handover_start"
       qpos="-1.53664e-08 -0.369214 0.247277 -0.000378379 1.51102 -4.90231e-05 0.0264712 0.0286525 1.63495e-09 -0.959697 1.1798 -0.000347334 -0.273969 1.55718e-06 0.00784828 0.00864461 1.63495e-09 -0.959697 1.1798 -0.000347334 -0.273969 1.55718e-06 0.00784828 0.00864461 -0.27189 -0.017962 0.287686 0.770332 0.000454306 0.637642 -0.000397681"
       ctrl="0 -0.378154 0.228072 0 1.5008 0 0.002 0 -0.96 1.16 0 -0.3 0 0.002 0 -0.96 1.16 0 -0.3 0 0.002"/>

@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
-"""Record msg_a trajectories per marker colour, for the swap intervention.
+"""Record msg_a trajectories per marker colour for the message-swap intervention.
 
-For every cached demo episode this replays arm A's stored Octo features and
-proprioception through the trained encoder and saves the resulting msg_a
-sequence, grouped by the episode's marker colour:
-
-    bank[colour] -> list of (T, d_m) arrays, one per episode of that colour
-
-cola_eval_marker.py --swap-messages then feeds B a donor drawn from a colour
-OTHER than the one actually on the box, and the tray B chooses says whether the
-message causally drives the routing decision.
-
-WHY RECORDED AND NOT LIVE. A live donor would need arm A re-run on a
-counterfactual observation every control step -- the same scene with a
-different marker -- which means rendering a second rollout in parallel. A
-recorded donor is one array lookup. The cost is that the donor was produced in
-a different physical state, so as the rollout diverges the message describes a
-scene that is not happening. That weakens a NEGATIVE result (B ignoring the
-message could mean B rejects an incoherent one) but not a POSITIVE one: if B
-follows the swapped colour's tray anyway, the channel is carrying the colour.
-
-The features are the SAME cached arrays the probe reads, so this measures the
-encoder on exactly the inputs it was trained on -- no rendering, no GPU.
+Replays arm A's cached features and states through the trained encoder and
+saves each episode's msg_a sequence, grouped by marker colour.
+eval_marker.py --swap-messages then feeds B a donor from a different
+colour. No rendering or GPU needed.
 """
 
 import argparse
@@ -32,7 +15,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from probe_messages import (                                    # noqa: E402
+from probe_messages_marker import (                             # noqa: E402
     CACHE, COLORS, FEATS, MSG_CKPT, build_messages, episode_colors,
     load_split, normalise_states)
 
@@ -64,9 +47,7 @@ def main():
             a.ckpt, feat, normalise_states(a.cache_dir, state),
             np.load(fo) if fo.exists() else None)
 
-        # Cut the flat (frames, d_m) array back into per-episode trajectories.
-        # ep_idx was built by np.repeat over episode_lens, so the boundaries are
-        # exactly the cumulative sums.
+        # Split the flat (frames, d_m) array back into per-episode trajectories.
         bounds = np.concatenate([[0], np.cumsum(lens)])
         for e, colour in enumerate(cols):
             bank[colour].append(msg[bounds[e]:bounds[e + 1]])
@@ -85,9 +66,8 @@ def main():
     for c in COLORS:
         if not bank[c]:
             raise SystemExit(f"no donor episodes for colour {c!r}")
-        # Ragged: episodes differ in length, so store each separately and keep
-        # an index rather than padding (padding would feed B zeros at the tail,
-        # which is the no-message condition, not a swap).
+        # Episodes are ragged, so store each separately (padding would feed B
+        # zeros, i.e. no message).
         out[f"{c}_n"] = np.int32(len(bank[c]))
         for i, arr in enumerate(bank[c]):
             out[f"{c}_{i}"] = arr.astype(np.float32)

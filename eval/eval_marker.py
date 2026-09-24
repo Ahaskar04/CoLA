@@ -1,35 +1,14 @@
-"""
-COLA rollout evaluation on the HIDDEN-MARKER handover task.
+"""Evaluate a CoLA checkpoint on the hidden-marker handover task.
 
-The box carries a coloured marker on its negative-x face: visible to arm A's
-wrist camera, physically occluded from B. After the handover, B must drop the
-box in the matching tray. B never sees the marker, so the colour can only reach
-it through A -- via the learned message channel, or via A's behaviour.
+A coloured marker on the box is visible to arm A only. After the handover,
+arm B must place the box in the tray of that colour (chance: 1 in 3). Every
+episode starts from the same pose, so the colour is the only thing that varies.
 
-WHY THE SCORING IS DIFFERENT FROM cola_eval_aloha.py. That script scores "B
-holds the box after the handover", which here would measure the handover and
-ignore the entire point of the task. Success here is CORRECT TRAY of three, so
-chance is 33.3%, not ~50%. The three-way split matters:
-
-    correct_tray : box settled in the tray matching the marker
-    wrong_tray   : box settled in one of the other two trays
-    no_tray      : box never reached any tray (handover failed, or dropped short)
-
-A policy that transfers no colour information can still reach a tray every time
--- it just picks at random, giving ~33%. So `tray_rate` (reached ANY tray) and
-`correct_given_tray` separate "can it place?" from "does it know where?". Only
-the second is about communication.
-
-EVERY EPISODE STARTS FROM AN IDENTICAL POSE. scripted_policy.py sets the
-handover-only reset offset to exactly zeros (line ~425), so unlike the plain
-handover task there is no y/z randomisation. The marker colour is the ONLY
-thing that varies between episodes. That is what makes this a clean test: there
-is no geometric cue B could exploit instead of the colour.
+Outcomes are correct tray, wrong tray or no tray. The headline metric is the
+correct-tray rate among completed handovers.
 
 Usage:
-    python3 cola_eval_marker.py \
-        --model .../checkpoints/best_model.pkl \
-        --episodes 150
+    python eval_marker.py --model RUN/checkpoints/best_model.pkl --episodes 150
 """
 
 import os
@@ -47,37 +26,33 @@ import mujoco
 import numpy as np
 from tqdm import tqdm
 
-_COLA = '/scratch/users/ntu/ahaskar0/v1/cola-research-code/handover/cola'
-if _COLA not in sys.path:
-    sys.path.insert(0, _COLA)
-from cola_architecture import COLAModel, CHUNK_SIZE   # noqa: E402
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from cola.model import COLAModel, CHUNK_SIZE          # noqa: E402
 
-SCENE_XML = ('/home/users/ntu/ahaskar0/CoLA/environments/handover_2arm_marker/'
-             'scene.xml')
-CACHE_DIR = ('/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/'
-             'cache_marker_v1')
-EXPERT_DIR = '/home/users/ntu/ahaskar0/CoLA/data_collection/handover_2arm_marker'
+SCENE_XML = str(REPO / 'envs' / 'handover_marker' / 'scene.xml')
+CACHE_DIR = str(REPO / 'data' / 'cache' / 'handover_marker')
+EXPERT_DIR = str(REPO / 'data_collection' / 'handover_marker')
+RESULTS_DIR = REPO / 'results' / 'eval_marker'
 
-# Demos stored every 10th sim step (collect_demos.py record_every_n_steps=10).
+# Demos were recorded every 10th sim step.
 CONTROL_DECIMATION = 10
 
 ARM_JOINTS = ['waist', 'shoulder', 'elbow', 'forearm_roll', 'wrist_angle',
               'wrist_rotate']
 
-# Must match scripted_policy.py: MARKER_COLORS order sets which colour each
-# episode index gets, and TRAY_POSITIONS sets where each tray sits.
+# Must match scripted_policy.py (colour order and tray positions).
 MARKER_COLORS = ["blue", "green", "yellow"]
 TRAY_POSITIONS = {
     "blue":   np.array([0.36, -0.247, 0.20]),
     "green":  np.array([0.36,  0.0,   0.20]),
     "yellow": np.array([0.36,  0.247, 0.20]),
 }
-# A box counts as "in" a tray when it settles within this radius of the tray
-# centre in the x-y plane. The trays are 0.247 apart in y, so 0.12 cannot
-# claim two trays at once; the expert landed 0.010 from centre.
+# A box is in a tray when it settles within this x-y radius of the tray centre
+# (trays are 0.247 m apart).
 TRAY_RADIUS = 0.12
-# ...and below this height, i.e. resting in the tray rather than carried over
-# it. The expert's box settled at z=0.069 after the drop.
+# ...and below this height (resting in the tray, not carried over it).
 TRAY_Z_MAX = 0.15
 
 GRIPPER_OPEN = 0.037
@@ -124,11 +99,9 @@ def build_scene(xml_path: str) -> Dict:
 
 
 def set_marker(scene, color: str):
-    """Make one marker visible and the other two invisible.
+    """Show the chosen colour's marker and hide the others.
 
-    Mirrors scripted_policy.py: alpha 1.0 on the chosen colour, 0.0 on the
-    rest. This writes model.geom_rgba, which persists across resets, so it must
-    be set every episode rather than once.
+    geom_rgba persists across resets, so this runs every episode.
     """
     model = scene['model']
     for c, gid in scene['marker_geoms'].items():
@@ -197,11 +170,7 @@ def touching_box(data, box_geom: int, finger_geoms: set) -> bool:
 
 
 def which_tray(box_pos) -> str:
-    """Return the tray the box is resting in, or None.
-
-    x-y distance to the tray centre plus a height ceiling: a box being CARRIED
-    over a tray at z=0.20 is not in it, only one that has settled.
-    """
+    """Tray the box is resting in (x-y radius plus height ceiling), or None."""
     if box_pos[2] > TRAY_Z_MAX:
         return None
     for color, centre in TRAY_POSITIONS.items():
@@ -223,13 +192,9 @@ def _handover_setup(scene_xml: str):
 
 
 def reset_episode(scene, scene_xml: str, color: str):
-    """Start with arm A holding the box, marker set to `color`.
+    """Reset to handover_start (A holding the box) with the given marker colour.
 
-    The collection's handover-only branch uses a ZERO offset -- every episode
-    starts from the handover_start keyframe unchanged -- so unlike the plain
-    handover eval there is no IK settling step to mirror and no grasp to
-    re-verify. Reproducing that exactly matters: adding randomisation the
-    training data never had would measure distribution shift, not policy skill.
+    Matches the training data, which has no start-pose randomisation.
     """
     model, data = scene['model'], scene['data']
     mujoco.mj_resetDataKeyframe(model, data, model.key('handover_start').id)
@@ -253,8 +218,8 @@ def load_swap_bank(path):
 
 def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
              cache_dir=CACHE_DIR, save_videos=True,
-             video_dir='evaluation_videos_marker',
-             results_path='logs/cola_eval_marker_results.json',
+             video_dir=str(RESULTS_DIR / 'videos'),
+             results_path=str(RESULTS_DIR / 'results.json'),
              max_control_steps=400, use_messages=True,
              video_camera='side_cam', seed_offset=0,
              swap_bank=None, swap_seed=0):
@@ -277,8 +242,8 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
     cfg = ckpt.get('config', {})
     use_proprio = bool(ckpt.get('use_proprio', cfg.get('use_proprio', False)))
     use_overhead = bool(ckpt.get('use_overhead', cfg.get('use_overhead', False)))
-    # Rebuild the channel at the width it was TRAINED at. Default 64 keeps
-    # every pre-sweep checkpoint loading unchanged.
+    use_wrist = bool(ckpt.get('use_wrist', cfg.get('use_wrist', True)))
+    # Rebuild the channel at its trained width (older checkpoints: 64).
     message_dim = int(ckpt.get('message_dim', cfg.get('message_dim', 64)))
     split_gripper = bool(ckpt.get('split_gripper', True))
     use_diffusion = bool(cfg.get('use_diffusion', False))
@@ -286,18 +251,18 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
     unet_dims = cfg.get('unet_dims', None)
 
     cola = COLAModel(use_proprio=use_proprio, split_gripper=split_gripper,
-                     use_overhead=use_overhead, use_diffusion=use_diffusion,
+                     use_overhead=use_overhead, use_wrist=use_wrist,
+                     use_diffusion=use_diffusion,
                      diffusion_unet=diffusion_unet, unet_dims=unet_dims,
                      message_dim=message_dim)
     cola.params = ckpt['params']
     print(f"   loaded (epoch {ckpt.get('epoch', '?')}, "
           f"val_loss {ckpt.get('val_loss', float('nan')):.6f})")
-    print(f"   overhead: {'on' if use_overhead else 'off'} | "
+    print(f"   cameras: {'+'.join(c for c, on in (('wrist', use_wrist), ('overhead', use_overhead)) if on)} | "
           f"proprio: {'on' if use_proprio else 'off'} | "
           f"head: {'diffusion+unet' if diffusion_unet else 'other'}")
 
-    # A checkpoint trained with the channel severed is meaningless to evaluate
-    # with messages on: it would see a signal it never saw in training.
+    # A checkpoint trained without messages must be evaluated without them.
     trained_with_messages = bool(ckpt.get('use_messages', True))
     if use_messages and not trained_with_messages:
         raise SystemExit(
@@ -307,9 +272,7 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
         print('   NOTE: severing messages on a checkpoint TRAINED with them. '
               'This is the out-of-distribution ablation, not the matched control.')
 
-    # An overhead-trained checkpoint can see both arms and the box, but NOT the
-    # marker -- it faces A and is occluded from any third-person view too. Say
-    # so rather than let a reader assume overhead leaks the colour.
+    # The overhead camera can't see the marker, so the colour still has to come from A.
     if use_overhead:
         print('   NOTE: overhead is ON. The marker faces arm A and is not '
               'legible from the overhead camera, so the colour still has to '
@@ -359,14 +322,11 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep in tqdm(range(n_episodes), desc='Evaluating'):
-        # Same cycling the collection used, so the eval is colour-balanced by
-        # construction: 150 episodes is exactly 50/50/50.
+        # Colours cycle with the episode index, so the eval is balanced.
         color = MARKER_COLORS[(seed_offset + ep) % len(MARKER_COLORS)]
         reset_episode(scene, scene_xml, color)
 
-        # Draw a donor whose marker was a DIFFERENT colour. The tray B picks is
-        # then the whole measurement: the true colour's tray means B is not
-        # using the message, the donor's tray means it is.
+        # Swap intervention: draw a donor message from a different colour.
         donor = donor_color = None
         if swap is not None:
             others = [c for c in MARKER_COLORS if c != color]
@@ -397,10 +357,7 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
                 proprio_a = normalise_state(read_state(data, scene['a']), 'state_a')
                 proprio_b = normalise_state(read_state(data, scene['b']), 'state_b')
 
-            # Donor episodes run ~150 steps but a rollout may reach 400. Past
-            # the end we HOLD THE LAST FRAME rather than zeroing: zeros are the
-            # no-message condition, so a zero tail would silently turn the back
-            # half of every long episode into the L0 ablation.
+            # Past the donor's end, hold its last frame (zeros would mean no message).
             msg_override = None
             if donor is not None:
                 msg_override = donor[min(control_step, len(donor) - 1)][None, :]
@@ -413,8 +370,7 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
             chunk_b = np.array(chunk_b[0])
 
             if split_gripper:
-                # Column 6 is a logit: threshold it and command the actuator
-                # endpoints. Denormalising a logit lands far outside ctrl range.
+                # Column 6 is a logit: threshold it to the gripper's open/closed targets.
                 grip_a = np.where(chunk_a[:, 6] > 0.0, GRIPPER_OPEN, GRIPPER_CLOSED)
                 grip_b = np.where(chunk_b[:, 6] > 0.0, GRIPPER_OPEN, GRIPPER_CLOSED)
                 chunk_a = denormalise(chunk_a, 'action_a')
@@ -451,9 +407,7 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
                     if transfer_run >= HOLD_STEPS:
                         transfer_done = True
                 else:
-                    # Require the box to REST in a tray for a few steps, so a
-                    # box passing through the region on its way elsewhere does
-                    # not score.
+                    # The box must rest in a tray for SETTLE_STEPS to count.
                     tray = which_tray(box)
                     if tray is not None and not b_holds:
                         settle_run += 1
@@ -498,14 +452,11 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
     n_tray = sum(e['landed_tray'] is not None for e in eps)
     n_xfer = sum(e['transfer_done'] for e in eps)
 
-    # Per-colour, because a policy that always picks one tray scores ~33%
-    # overall and looks like partial information. The per-colour split exposes
-    # that: a constant policy is 100/0/0, real information is balanced.
+    # Per-colour breakdown: a policy that always picks one tray shows up here.
     by_color = {}
     for c in MARKER_COLORS:
         sub = [e for e in eps if e['marker_color'] == c]
-        # Conditioned on transfer for the same reason as the headline: an
-        # episode that never handed the box over says nothing about routing.
+        # Conditioned on a completed handover, like the headline.
         sub_x = [e for e in sub if e['transfer_done']]
         by_color[c] = {
             'n': len(sub),
@@ -516,28 +467,21 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
                       for t in MARKER_COLORS + [None]},
         }
 
-    # Correct answers among episodes where the handover actually completed.
-    # THIS IS THE HEADLINE NUMBER. A policy cannot route a box it never
-    # received, so raw correct_rate conflates two unrelated abilities:
-    # manipulation (can B take the box?) and routing (does B know where it
-    # goes?). Only the second is about communication. The no-messages control
-    # made this concrete -- it failed the physical handover in 93% of episodes,
-    # so its raw 1.5% mostly measured a broken grasp, not a missing colour.
+    # Headline: correct tray among completed handovers, which separates
+    # routing (communication) from manipulation.
     n_correct_xfer = sum(e['correct'] for e in eps if e['transfer_done'])
     correct_given_xfer = (100.0 * n_correct_xfer / n_xfer) if n_xfer else None
 
     results['summary'] = {
         'n_episodes': n,
-        # Report this FIRST: correct tray among completed handovers.
+        # Headline metric.
         'correct_given_transfer': correct_given_xfer,
         'n_transfers': n_xfer,
         'n_correct_given_transfer': n_correct_xfer,
         'correct_rate': 100.0 * n_correct / n,
         'tray_rate': 100.0 * n_tray / n,
         'transfer_rate': 100.0 * n_xfer / n,
-        # Narrower still: of the times B placed the box ANYWHERE, how often was
-        # it the right tray? Differs from correct_given_transfer only by the
-        # episodes that transferred but never reached a tray.
+        # Correct among episodes that reached any tray.
         'correct_given_tray': (100.0 * n_correct / n_tray) if n_tray else None,
         'chance_rate': 100.0 / len(MARKER_COLORS),
         'by_color': by_color,
@@ -594,8 +538,8 @@ if __name__ == '__main__':
     p.add_argument('--scene-xml', default=SCENE_XML)
     p.add_argument('--cache-dir', default=CACHE_DIR)
     p.add_argument('--no-videos', action='store_true')
-    p.add_argument('--video-dir', default='evaluation_videos_marker')
-    p.add_argument('--results-path', default='logs/cola_eval_marker_results.json')
+    p.add_argument('--video-dir', default=str(RESULTS_DIR / 'videos'))
+    p.add_argument('--results-path', default=str(RESULTS_DIR / 'results.json'))
     p.add_argument('--max-control-steps', type=int, default=400,
                    help='expert episodes run ~152 steps; 400 leaves room for a '
                         'policy that wanders before finding the tray.')

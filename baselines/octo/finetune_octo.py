@@ -1,28 +1,14 @@
-"""Finetune Octo on the ALOHA handover demos, one arm at a time.
+"""Finetune Octo on the handover demos, one arm at a time.
 
-This follows octo's own examples/02_finetune_new_observation_action.py, which
-finetunes on the ALOHA sim CUBE HANDOVER dataset -- i.e. this task. The recipe
-there is not optional decoration: a pretrained Octo emits 7-d delta end-effector
-actions for a single WidowX-like arm, and ALOHA needs absolute joint positions.
-There is no correspondence between those spaces, which is why the reference
-DELETES the pretrained action head and learns a new one. Everything below is
-that recipe, with the data coming from HDF5 instead of RLDS.
+Follows Octo's ALOHA finetuning example: the pretrained action head is
+replaced (ALOHA needs absolute joint targets), proprio is added through a
+LowdimObsTokenizer, the unused wrist tokenizer is dropped, and the pretrained
+transformer weights are kept.
 
-  - wrist image tokenizer removed (the reference removes it; our demos have no
-    second camera per arm anyway)
-  - proprio added as a LowdimObsTokenizer over the arm's own joint state
-  - action head fully replaced with L1ActionHead, action_dim 7 for one arm or
-    14 for the centralised both-arm variant
-  - action_horizon 50, L1 loss, following Zhao et al. (ACT) as the reference does
-  - pretrained transformer weights merged in; only the head and the proprio
-    position encodings start from scratch
+--arm a / --arm b give the decentralised baseline (two independent policies,
+no channel); --arm both gives the centralised variant.
 
---arm a and --arm b give the DECENTRALISED baseline: two independent policies,
-each seeing only its own wrist camera, with no channel between them. That is the
-comparison CoLA is actually about. --arm both gives the centralised reference
-recipe as an upper bound.
-
-    python finetune_octo_arm.py --arm a --save_dir /path/to/ckpt_a
+    python finetune_octo.py --arm a --save_dir CKPT_DIR
 """
 
 import argparse
@@ -56,7 +42,7 @@ from octo.utils.jax_utils import initialize_compilation_cache
 from octo.utils.spec import ModuleSpec
 from octo.utils.train_utils import freeze_weights, merge_params, TrainState
 
-import octo_h5_data as D
+import octo_data as D
 
 from loss_curve import write_history
 from octo_unet_head import UNetActionHead
@@ -195,10 +181,7 @@ def main():
 
     print('\n3. Rebuilding model for the new observation & action space...')
     config = pretrained.config
-    # The reference drops the wrist tokenizer; our per-arm demos have one camera.
-    # octo-small-1.5 ships pretrained `primary` AND `wrist` tokenizers. Drop
-    # the wrist one only when there is no second camera to feed it -- an
-    # unfed tokenizer would be asked for an observation key that never arrives.
+    # Drop the pretrained wrist tokenizer unless a second camera feeds it.
     if not args.wrist_key and 'wrist' in config['model']['observation_tokenizers']:
         del config['model']['observation_tokenizers']['wrist']
     if use_proprio:
@@ -209,8 +192,7 @@ def main():
         )
     else:
         config['model']['observation_tokenizers'].pop('proprio', None)
-    # Fully replace the head: the pretrained one speaks 7-d delta EE for a
-    # WidowX, this one speaks absolute ALOHA joint targets.
+    # Replace the head: the pretrained one predicts delta end-effector actions.
     if args.head == 'diffusion':
         # Same kwargs octo-small-1.5 ships with, only the horizon and dim change.
         config['model']['heads']['action'] = ModuleSpec.create(
@@ -221,9 +203,7 @@ def main():
             use_map=False, n_diffusion_samples=1, dropout_rate=0.0,
         )
     elif args.head == 'unet':
-        # Chi et al.'s 1D temporal U-Net denoiser in a 1.5-format head (see
-        # octo_unet_head.py for why octo's own UNetDDPMActionHead can't be
-        # used). No pretrained weights exist for it, so it always starts cold.
+        # Chi et al.'s 1D U-Net in a 1.5-format head (see octo_unet_head.py); no pretrained weights.
         unet_features = tuple(int(x) for x in args.unet_features.split(','))
         div = 2 ** (len(unet_features) - 1)
         assert args.action_horizon % div == 0, (
@@ -250,11 +230,7 @@ def main():
         config, example_batch, text_processor, verbose=True,
         dataset_statistics=stats,
     )
-    # Report which action-head tensors actually come from pretraining. merge_params
-    # silently skips any key whose shape changed -- e.g. the diffusion head's
-    # output layer at action_horizon 50 (350 wide) vs the pretrained 4 (28 wide)
-    # -- and a skipped tensor starts from random init. Whether the head is warm
-    # is the premise of the horizon-4 experiment, so it is measured, not assumed.
+    # Report which head tensors were loaded: merge_params skips shape mismatches.
     import flax
     _new = flax.traverse_util.flatten_dict(model.params)
     _old = flax.traverse_util.flatten_dict(pretrained.params)
@@ -277,9 +253,7 @@ def main():
         [optax.linear_schedule(0, args.lr, 100), optax.constant_schedule(args.lr)],
         [100])
     tx = optax.adamw(schedule)
-    # freeze_weights fnmatches the FULL dot-joined parameter path, so a bare
-    # module name never matches -- every pattern here has to be anchored the
-    # way octo's own configs write them.
+    # freeze_weights matches full dot-joined parameter paths, so patterns are anchored.
     frozen_keys = list(model.config['optimizer']['frozen_keys'])
     if args.tune == 'head_only':
         frozen_keys.append('octo_transformer.*')
@@ -291,13 +265,10 @@ def main():
     print(f'   frozen keys: {frozen_keys}')
     tx = freeze_weights(tx, model.params, frozen_keys)
     if args.grad_accum > 1:
-        # MultiSteps accumulates and applies once every k calls, so k micro
-        # steps == one optimiser step at the full effective batch.
+        # MultiSteps applies one optimiser step every k micro-steps.
         tx = optax.MultiSteps(tx, every_k_schedule=args.grad_accum)
 
-    # Report what is actually trainable: a pattern that silently matches
-    # nothing looks identical to a full finetune in the loss curve until the
-    # numbers are compared against another run.
+    # Report what is actually trainable.
     from fnmatch import fnmatch
     import flax
     n_all = n_train = 0
@@ -440,9 +411,7 @@ def main():
               f'{args.steps}. Resume state -> {resume_path}')
         return
 
-    # The periodic save only fires on multiples of save_every, so without this
-    # the last (steps % save_every) optimiser steps were trained and then
-    # thrown away -- a 12600-step run was evaluated at step 12000.
+    # Save the final steps that the periodic save would miss.
     if start < stop and args.steps % args.save_every != 0:
         train_state.model.save_pretrained(step=args.steps - 1,
                                           checkpoint_path=str(save_dir))

@@ -3,12 +3,9 @@
     <key name="neutral_pose" qpos="0 -0.96 1.16 0 -0.3 0 0.0084 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084 0.0084"
       ctrl="0 -0.96 1.16 0 -0.3 0 0.0084 0 -0.96 1.16 0 -0.3 0 0.0084"/>
 
-    <!-- Arm A holding the box HORIZONTALLY, arm B at neutral: the state a
-         handover-only episode starts from.
-         A's wrist is at identity orientation (horizontal, gripper facing forward)
-         so the marker on the box's negative-x face is visible to Arm A's wrist camera.
-         Built by IK from neutral to z=0.25, then settled 800 steps under gravity.
-         Both grippers' ctrl is 0.002 (CLOSED).
+    <!-- Handover-only start: arm A holds the box level (so the marker faces its
+         wrist camera), arm B at neutral. Built by IK, then settled 800 steps.
+         Both gripper ctrls are 0.002 (closed).
          23 qpos: arms 0-15, box freejoint 16-22 (xyz + wxyz quat). -->
     <key name="handover_start"
       qpos="2.30771e-09 -0.848376 1.3402 -0.000369863 -0.42442 -0.000459692 0.026682 0.0288633 1.63495e-09 -0.959697 1.1798 -0.000347334 -0.273969 1.55718e-06 0.00784828 0.00864461 -0.272177 -0.0178589 0.230911 0.999994 -0.000411445 0.00352776 -2.58183e-05"

@@ -1,16 +1,12 @@
-"""Frozen pi0.5 as a feature function, for the evaluator.
+"""Frozen pi0.5 as a per-frame feature function for the evaluator.
 
-The rollout counterpart of extract_pi05_features.py: same weights, same prompt,
-same pooling, one frame at a time. Kept in its own module so the evaluator and
-the extractor cannot drift apart.
+Same weights, prompt and pooling as extract_pi05_features.py.
 """
 import os
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-os.environ.setdefault("OPENPI_DATA_HOME", "/scratch/users/ntu/ahaskar0/openpi_cache")
 
 import flax.nnx as nnx      # noqa: E402
 import jax                  # noqa: E402
@@ -22,8 +18,8 @@ import openpi.models.pi0 as _pi0                # noqa: E402
 import openpi.models.pi0_config as _pi0_config  # noqa: E402
 import openpi.models.tokenizer as _tokenizer    # noqa: E402
 
-import pi05_marker_data as D                    # noqa: E402
-import train_cola_pi05 as T                     # noqa: E402
+import pi05_data as D                           # noqa: E402
+import train_cola_pi05_lora as T                # noqa: E402
 from extract_pi05_features import MAX_TOKEN_LEN, PROMPT   # noqa: E402
 
 

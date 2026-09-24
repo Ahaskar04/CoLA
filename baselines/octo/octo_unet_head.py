@@ -1,22 +1,10 @@
 """U-Net diffusion action head for Octo-1.5 batches.
 
-octo ships UNetDDPMActionHead, but it predates the 1.5 data format and cannot
-be used as-is:
-  * loss() takes (action_pad_mask, timestep_pad_mask) -- the reverse of every
-    other octo head -- so the shared training loop would swap the masks;
-  * it assumes a per-dimension action_pad_mask of shape (B, A) and noisy
-    actions without a window axis, while 1.5 batches carry (B, W, H, A).
-  * its use_map / flatten_tokens defaults are the tuple (False,), which is
-    truthy, so the default construction trips its own assertion.
-
-This head keeps octo's ConditionalUnet1D denoiser (Chi et al.'s 1D temporal
-U-Net: convolutions run ALONG the action chunk, FiLM conditioning on the
-readout embedding and diffusion time at every block) and wraps it in
-DiffusionActionHead's 1.5-format loss and DDPM sampler.
-
-The U-Net halves the chunk once per level but the last, so action_horizon
-must be divisible by 2**(len(down_features)-1): 4 for the default size.
-There are no pretrained weights for it: the head always starts cold.
+Octo's UNetDDPMActionHead predates the 1.5 batch format (mask order, shapes
+and use_map defaults differ), so this head wraps Octo's ConditionalUnet1D
+(Chi et al.) in DiffusionActionHead's 1.5-format loss and DDPM sampler.
+action_horizon must be divisible by 2**(len(down_features) - 1). The head has
+no pretrained weights.
 """
 import logging
 from typing import Dict, Optional, Tuple
@@ -52,9 +40,7 @@ class UNetActionHead(nn.Module):
     n_diffusion_samples: int = 1
 
     def setup(self):
-        # One halving per level except the last, so the chunk must survive
-        # len(down_features)-1 of them: 4 for the (256,512,1024) default, 2 for
-        # a two-level (128,256) CoLA-sized head.
+        # The chunk is halved once per level except the last.
         div = 2 ** (len(self.down_features) - 1)
         assert self.action_horizon % div == 0, (
             f"UNet with {len(self.down_features)} levels halves the chunk "

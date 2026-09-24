@@ -1,53 +1,19 @@
-"""
-Pretrained-Octo rollout evaluation on the ALOHA handover scene.
+"""Evaluate pretrained (frozen) Octo on the ALOHA handover scene.
 
-Purpose: answer one question. Can a frozen, pretrained Octo pick the box up on
-this robot, in this simulator, at all? The headline number is a_lift_rate.
-Everything else is scored the same way cola_eval_aloha.py scores it, so the
-rows line up, but do not expect the handover criteria to fire -- a single Octo
-policy has no partner channel and no reason to time a transfer.
+Tests whether pretrained Octo can pick up the box here at all (headline:
+a_lift_rate). Scoring and summary are eval_2arm.py's code, and
+check_criterion() refuses to run if they have drifted.
 
-Scoring mirrors cola_eval_aloha.py exactly: same LIFT_Z, HOLD_STEPS,
-SETTLE_STEPS, DROP_STEPS, same two-phase transfer/hold/return criteria, same
-video labels, same summary keys.
-
-------------------------------------------------------------------------------
-WHAT THIS NUMBER CAN AND CANNOT TELL YOU
-------------------------------------------------------------------------------
-Octo emits 7-d DELTA END-EFFECTOR actions (dx dy dz, droll dpitch dyaw,
-gripper) normalized to a source dataset. This robot takes ABSOLUTE joint
-position targets. Three lossy conversions sit between them, all here:
-
-  1. Unnormalization uses --octo-dataset's action statistics.
-  2. Delta position is converted to joint targets by IK against the scripted
-     expert's mink rig. ORIENTATION DELTAS ARE DISCARDED -- the wrist is held
-     at GRASP_ORIENTATION throughout. A policy that wanted to rotate cannot.
-  3. Rate. Octo's source data is ~5 Hz; this loop is 50 Hz. --action-scale
-     exists to absorb that and is UNCALIBRATED.
-
-So a LOW score is ambiguous: it is consistent with Octo being unable to do the
-task here, and equally consistent with any of the three conversions being
-wrong. A HIGH score is unambiguous and is the useful outcome -- it would mean
-the frozen backbone really does carry the pick, and that an adapter only has to
-add coordination.
-
-Run --probe-actions FIRST. It reports raw Octo delta magnitudes with no physics
-and no IK, which separates "the model outputs nothing useful" from "my bridge
-is wrong" before you spend an hour on rollouts.
-------------------------------------------------------------------------------
+Octo emits normalised 7-d delta end-effector actions; this robot takes
+absolute joint targets. The bridge unnormalises with --octo-dataset
+statistics, converts position deltas to joint targets with the expert's IK
+(orientation deltas are discarded) and rescales by the uncalibrated
+--action-scale, so a low score may reflect the bridge rather than Octo.
 
 Usage:
-    # step 0: are the raw actions even sane?
-    python eval_octo_pickup.py --probe-actions --episodes 5
-
-    # step 1: does it pick anything up?
-    python eval_octo_pickup.py --episodes 50 --criterion transfer
-
-    # step 2: if a_lift_rate is 0 everywhere, sweep the one free parameter
-    for s in 0.02 0.05 0.1 0.25 0.5; do
-        python eval_octo_pickup.py --episodes 20 --action-scale $s --no-videos \
-            --results-path logs/octo_scale_$s.json
-    done
+    python eval_octo_zeroshot.py --probe-actions --episodes 5     # raw action scale only
+    python eval_octo_zeroshot.py --episodes 50 --criterion transfer
+    python eval_octo_zeroshot.py --episodes 20 --action-scale 0.1 --no-videos
 """
 
 import os
@@ -63,16 +29,38 @@ import mujoco
 import numpy as np
 from tqdm import tqdm
 
-# scene_fov58.xml, NOT scene.xml. The wrist cameras in aloha.xml were later
-# widened from focal 1.93e-3 (fovy 58.0 deg) to 1.2e-3 (83.4 deg), but every
-# cached demo image and extracted feature was rendered at 58.0 deg. Evaluating
-# against the widened camera shows the policy a visual distribution it never
-# trained on. This scene pins the original FOV so training and rollout match.
-SCENE_XML = '/home/users/ntu/ahaskar0/CoLA/environments/handover_2arm/scene_fov58.xml'
-EXPERT_DIR = '/home/users/ntu/ahaskar0/CoLA/data_collection/handover_2arm'
+# Wrist cameras at the 58-degree FOV the cached demos were rendered with
+# (aloha.xml was later widened).
+REPO = Path(__file__).resolve().parents[2]
+SCENE_XML = str(REPO / 'envs' / 'handover_2arm' / 'scene_fov58.xml')
+EXPERT_DIR = str(REPO / 'data_collection' / 'handover_2arm')
+RESULTS_DIR = REPO / 'results' / 'octo_zeroshot'
+COLA_SOURCE = str(REPO / 'eval' / 'eval_2arm.py')
 
-# Physics steps per control step. Matches cola_eval_aloha.py, which matches
-# collect_demos.py record_every_n_steps=10.
+# Markers are assembled so this file's own copies of them do not match first.
+_SCORE_START = ' ' * 12 + 'for k in range(' + 'n_exec):'
+_SCORE_END = ' ' * 4 + 'renderer.' + 'close()'
+_SUM_START = ' ' * 4 + 'scored = len(' + "results['episodes'])"
+_SUM_END = '\n' + ' ' * 4 + '}\n'
+
+
+def _block(text, start, end):
+    i = text.index(start)
+    return text[i:text.index(end, i) + len(end)]
+
+
+def check_criterion():
+    """Refuse to run if the scoring or summary code no longer matches CoLA's."""
+    cola = Path(COLA_SOURCE).read_text()
+    mine = Path(__file__).read_text()
+    for name, s, e in (('scoring loop', _SCORE_START, _SCORE_END),
+                       ('summary', _SUM_START, _SUM_END)):
+        if _block(cola, s, e) != _block(mine, s, e):
+            raise SystemExit(f'{name} differs from {COLA_SOURCE} -- regenerate '
+                             f'eval_octo_zeroshot.py before trusting a number from it')
+    print("   criterion: identical to CoLA's evaluator (scoring loop + summary)")
+
+# Physics steps per control step (as in eval_2arm.py).
 CONTROL_DECIMATION = 10
 
 BOX_X_RANGE = (-0.12, 0.12)
@@ -88,9 +76,7 @@ VIDEO_CAMERA = 'teleoperator_pov'
 GRIPPER_OPEN = 0.037
 GRIPPER_CLOSED = 0.002
 
-# --------------------------------------------------------------------------
-# Criterion constants. Identical to cola_eval_aloha.py and expert_replay.py.
-# --------------------------------------------------------------------------
+# Success-criterion constants (as in eval_2arm.py).
 LIFT_Z = 0.10
 HOLD_STEPS = 5
 SETTLE_STEPS = 20
@@ -101,33 +87,23 @@ GRIPPER_OPEN_FRAC = 0.6
 
 CRITERIA = ('transfer', 'hold', 'return')
 
-# --------------------------------------------------------------------------
-# Octo
-# --------------------------------------------------------------------------
+# Pretrained Octo checkpoints.
 OCTO_CHECKPOINTS = {
     'octo-small': 'hf://rail-berkeley/octo-small-1.5',
     'octo-base': 'hf://rail-berkeley/octo-base-1.5',
 }
-# Octo is language-conditioned, so this is the only task signal it receives.
-# Deliberately NOT "coordinate with partner": that phrase describes the
-# coordination, not the manipulation, and this script is testing manipulation.
+# Language instruction, Octo's only task signal (describes the pickup).
 INSTRUCTION_A = 'pick up the red box'
 INSTRUCTION_B = 'take the red box from the other arm'
 # mink iterations per commanded delta. More is closer tracking, and slower.
 IK_ITERS = 40
 IK_DT = 1.0 / 200.0
-# Chunk length to execute open-loop between Octo queries. Matches CoLA's
-# CHUNK_SIZE so the control cadence is comparable; Octo's own horizon is
-# usually longer and gets truncated to this.
+# Actions executed open-loop per Octo query (CoLA's CHUNK_SIZE).
 CHUNK_SIZE = 10
 
 
 def build_scene(xml_path: str) -> Dict:
-    """Load the scene and cache every id the rollout needs.
-
-    Identical to cola_eval_aloha.build_scene, plus the gripper site name per
-    arm, which the IK bridge needs.
-    """
+    """Load the scene and cache every id the rollout needs (plus gripper sites for IK)."""
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
 
@@ -139,9 +115,7 @@ def build_scene(xml_path: str) -> Dict:
             'subtree': model.body(f'{prefix}/base_link').id,
             'qadr': np.array([model.joint(f'{prefix}/{n}').qposadr[0] for n in ARM_JOINTS]),
             'finger_qadr': model.joint(f'{prefix}/left_finger').qposadr[0],
-            # Both finger pads. CoLA's check_gripper_box_contact_right lists
-            # right/right_g* twice and omits right/left_g*, so it misses
-            # contacts on one pad; this does not.
+            # Both finger pads.
             'finger_geoms': {
                 model.geom(f'{prefix}/{side}_g{i}').id
                 for side in ('left', 'right') for i in range(3)
@@ -193,12 +167,7 @@ _HO_SETUP = None
 
 
 def _expert_setup(scene_xml: str):
-    """Lazily build the scripted expert's mink IK rig, reused across episodes.
-
-    Needed for two things here: constructing the handover-only start state, and
-    converting Octo's delta end-effector actions into joint targets. Both use
-    the expert's own rig rather than a second implementation that could drift.
-    """
+    """Build the expert's IK rig once (start state and delta-to-joint conversion)."""
     global _HO_SETUP
     if _HO_SETUP is None:
         import sys
@@ -224,11 +193,10 @@ def reset_episode(scene, seed: int):
 
 
 def reset_episode_handover(scene, seed: int, scene_xml: str) -> bool:
-    """Start with arm A already holding the box, as the handover-only demos do.
+    """Start with arm A holding the box, as in the handover-only demos.
 
-    Mirrors scripted_policy.run_episode's handover_only branch. Returns False if
-    the randomised reset shook the box loose, so the caller can skip rather than
-    score an episode that began with an empty gripper.
+    Mirrors scripted_policy.py's handover_only branch. Returns False if the
+    grasp didn't survive, so the episode can be skipped.
     """
     import mink
     su = _expert_setup(scene_xml)
@@ -283,12 +251,7 @@ def apply_action(data, arm, action):
 
 
 def hold_chunk(scene, arm, n=CHUNK_SIZE):
-    """A chunk that commands the arm to stay exactly where it is.
-
-    Used for arm B when --arm-b hold. Reading the CURRENT joint positions
-    rather than the neutral keyframe means B holds wherever it happens to be,
-    including a handover-only start pose.
-    """
+    """A chunk that holds the arm at its current joint positions (--arm-b hold)."""
     q = scene['data'].qpos[arm['qadr']].copy()
     grip = float(scene['data'].ctrl[arm['gripper_actuator']])
     chunk = np.zeros((n, 7), dtype=np.float32)
@@ -298,16 +261,9 @@ def hold_chunk(scene, arm, n=CHUNK_SIZE):
 
 
 class OctoPolicy:
-    """A pretrained Octo checkpoint driving one arm, via an IK bridge.
+    """A pretrained Octo checkpoint driving one arm through the IK bridge.
 
-    Read the module docstring before trusting any number from this. The short
-    version: Octo speaks delta end-effector, this robot speaks absolute joint
-    targets, and everything between them is uncalibrated.
-
-    Observation handling: Octo consumes a short window of frames, not a single
-    image, so the buffer is rebuilt from scratch at every reset(). Carrying
-    frames across an episode boundary would put the transformer in a state no
-    trajectory ever produced.
+    The observation window is reset every episode.
     """
 
     def __init__(self, checkpoint: str, dataset_name: str, scene_xml: str,
@@ -322,14 +278,11 @@ class OctoPolicy:
         print(f'   loading {checkpoint} ...')
         self.model = OctoModel.load_pretrained(checkpoint)
 
-        # Window size is not constant across Octo releases; read it off the
-        # example batch the checkpoint ships with rather than hardcoding 2.
+        # Window size varies across Octo releases; read it from the example batch.
         self.window = int(
             self.model.example_batch['observation']['image_primary'].shape[1])
 
-        # dataset_statistics is a dict-of-datasets on pretrained checkpoints and
-        # flat on a single-dataset finetune. Support both; fail loudly with the
-        # available keys rather than a bare KeyError.
+        # dataset_statistics is keyed by dataset on pretrained checkpoints, flat on finetunes.
         stats = self.model.dataset_statistics
         if 'action' in stats:
             self.action_stats = stats['action']
@@ -348,10 +301,7 @@ class OctoPolicy:
         self.camera = camera
         self.gripper_open_high = gripper_open_high
         self.wrist_orientation = wrist_orientation
-        # Control condition: draw from Octo's OUTPUT MARGINAL instead of from
-        # Octo. Same action distribution, zero visual or language
-        # conditioning. If the score does not move, the conditioning is
-        # buying nothing and the number is not measuring Octo's prior.
+        # Control: sample from Octo's action marginal, with no conditioning.
         self.random_actions = random_actions
         try:
             self.horizon = int(self.model.config['model']['heads']['action']
@@ -387,8 +337,7 @@ class OctoPolicy:
     def _push(self, image):
         self.num_obs += 1
         if self.hist is None:
-            # Prime a fresh buffer by repeating the first frame. Standard, but
-            # note it means the first few steps see no motion at all.
+            # Prime a fresh buffer by repeating the first frame.
             self.hist = np.repeat(image[None, ...], self.window, axis=0)
         else:
             self.hist = np.concatenate([self.hist[1:], image[None, ...]], axis=0)
@@ -400,12 +349,7 @@ class OctoPolicy:
         key = ('timestep_pad_mask'
                if 'timestep_pad_mask' in self.model.example_batch['observation']
                else 'pad_mask')
-        # Octo's own HistoryWrapper marks the repeated priming frames as
-        # PADDING (gym_wrappers.stack_and_pad: mask[:horizon - min(num_obs,
-        # horizon)] = 0), so the transformer masks them out. Sending all-True
-        # instead claims two copies of one frame are two real consecutive
-        # observations. Only affects the first query of each episode, but it
-        # is a deviation from the reference for no reason.
+        # Mark the repeated priming frames as padding, as Octo's HistoryWrapper does.
         mask = np.ones((1, self.window), dtype=bool)
         mask[0, :self.window - min(self.num_obs, self.window)] = False
         obs[key] = mask
@@ -420,8 +364,7 @@ class OctoPolicy:
             z = np.asarray(self.jax.random.normal(
                 sub_, (self.horizon, len(mean))), dtype=np.float64)
             act = z * std + mean
-            # Dim 6 carries mask=False in the bridge statistics, so it is
-            # never unnormalized -- the head emits it directly in ~[0, 1].
+            # Dim 6 (gripper) is not normalised; the head emits it directly in ~[0, 1].
             mask = np.asarray(self.action_stats.get(
                 'mask', np.ones_like(mean, dtype=bool)))
             act[:, ~mask] = np.clip(z[:, ~mask] * 0.25 + 0.5, 0.0, 1.0)
@@ -434,19 +377,14 @@ class OctoPolicy:
             self._observation(), self.task,
             unnormalization_statistics=self.action_stats, rng=sub)
         actions = np.asarray(actions)
-        # Shape varies by release: (batch, horizon, dim) or
-        # (batch, window, horizon, dim). Keep the last two axes either way.
+        # Output is (batch, horizon, dim) or (batch, window, horizon, dim); keep the last two axes.
         return actions.reshape(-1, actions.shape[-2], actions.shape[-1])[0]
 
     def _delta_to_joint_targets(self, scene, arm, deltas):
-        """Integrate delta xyz into absolute joint targets by IK.
+        """Convert delta xyz (K, 3), applied cumulatively from the current
+        gripper pose, into absolute joint targets by IK.
 
-        deltas is (K, 3) in metres, applied cumulatively from the arm's CURRENT
-        gripper pose. Octo's ORIENTATION deltas are discarded: the rig tracks
-        GRASP_ORIENTATION throughout, because the expert's task fixes wrist
-        orientation and there is no validated mapping from Octo's rpy
-        convention into this one. This is a real limitation of the baseline,
-        not a detail -- a policy that wanted to rotate the wrist cannot.
+        Orientation deltas are discarded; the wrist orientation is held fixed.
         """
         import mink
         su = _expert_setup(self.scene_xml)
@@ -458,19 +396,14 @@ class OctoPolicy:
         dof_ids = su[f'{side}_dof_ids']
         ee_task = su[f'{side}_ee_task']
 
-        # Sync the rig to the live scene, so deltas apply from where the arm
-        # actually is rather than from where IK last left it.
+        # Sync the IK rig to the live scene.
         d.qpos[:] = scene['data'].qpos
         d.qvel[:] = 0.0
         mujoco.mj_forward(m, d)
         cfg.update(d.qpos)
         su['posture_task'].set_target_from_configuration(cfg)
 
-        # Pin the arm we are NOT driving to wherever it currently is.
-        # su['tasks'] holds BOTH FrameTasks, so solve_ik raises TargetNotSet
-        # unless the idle one has a target -- and if it keeps a stale target
-        # from an earlier chunk, the QP quietly drags that arm toward it.
-        # Re-pinning every chunk fixes both.
+        # Pin the idle arm at its current pose (every chunk, so no stale target).
         other = 'right' if side == 'left' else 'left'
         mink.move_mocap_to_frame(m, d, f'{other}/target', f'{other}/gripper', 'site')
         su[f'{other}_ee_task'].set_target(
@@ -479,13 +412,8 @@ class OctoPolicy:
         goal = d.site(f'{side}/gripper').xpos.copy()
         targets = np.zeros((len(deltas), 6), dtype=np.float32)
 
-        # At neutral_pose the wrist sits ~78 deg away from GRASP_ORIENTATION,
-        # so pinning to it slews the arm ~1.9 rad during the FIRST chunk of
-        # every episode -- motion Octo never asked for. 'grasp' accepts that
-        # transient because it is the orientation the box actually has to be
-        # gripped from; 'initial' holds whatever the wrist starts at, which
-        # commands no uncommanded motion but is unlikely to afford a grasp.
-        # Either way Octo's own rotation deltas are discarded.
+        # 'grasp' holds the wrist at GRASP_ORIENTATION (a large slew on the first
+        # chunk); 'initial' holds its starting orientation.
         if self.wrist_orientation == 'grasp':
             quat = su['GRASP_ORIENTATION'].wxyz
         else:
@@ -513,42 +441,25 @@ class OctoPolicy:
         steps = raw[:CHUNK_SIZE]
         self.n_real = len(steps)
         if len(steps) < CHUNK_SIZE:
-            # Octo's horizon (4 on octo-small-1.5) is shorter than CHUNK_SIZE,
-            # so the tail of every chunk has to be invented. Columns 0-5 are
-            # DELTAS, and holding position means padding them with ZERO.
-            # Repeating the last delta -- which is what "hold the last action"
-            # means in an ABSOLUTE action space -- keeps the arm travelling and
-            # inflates the chunk's commanded displacement by 2.5x. Column 6 is
-            # absolute, so the gripper genuinely is held.
+            # Octo's horizon can be shorter than CHUNK_SIZE: pad the delta columns
+            # with zeros (hold position) and repeat the absolute gripper command.
             pad = np.zeros((CHUNK_SIZE - len(steps), steps.shape[1]),
                            dtype=steps.dtype)
             pad[:, 6] = steps[-1, 6]
             steps = np.concatenate([steps, pad], axis=0)
 
-        # Diagnostics, so a zero score is attributable without a re-run. Only
-        # the REAL actions are counted: the zero padding would otherwise drag
-        # every delta statistic toward zero and hide the true action scale.
+        # Diagnostics use only the real (unpadded) actions.
         real = steps[:self.n_real]
         self.delta_norms.extend(np.linalg.norm(real[:, :3], axis=1).tolist())
         self.grip_values.extend(real[:, 6].tolist())
         # One value per chunk, to measure how often the hand changes state.
         self.grip_chunk_values.append(float(real[-1, 6]))
 
-        # Octo's dx/dy/dz are EGOCENTRIC: +x away from the robot base, +z up,
-        # in the BASE frame of whatever arm produced the training data. The IK
-        # bridge integrates onto a WORLD-frame gripper position, so the deltas
-        # have to be rotated into world first. left/base_link happens to be
-        # identity, but right/base_link is rotated 180 deg about z -- without
-        # this, arm B is driven with its x and y inverted, i.e. backwards.
+        # Octo's deltas are in the arm's base frame; rotate them into world.
         R_base = scene['data'].xmat[arm['subtree']].reshape(3, 3)
         deltas = (steps[:, :3] * self.action_scale) @ R_base.T
 
-        # Is Octo actually aiming at the box? This is the one diagnostic that
-        # separates "undirected motion" from "directed at the wrong place":
-        # cosine between the chunk's net commanded displacement and the
-        # direction from the gripper to the box. ~0 means a random walk;
-        # negative means systematically away; only clearly positive means the
-        # policy is reaching.
+        # Cosine between the net commanded displacement and the gripper-to-box direction.
         net = deltas.sum(axis=0)
         to_box = (scene['data'].qpos[scene['box_qposadr']:scene['box_qposadr'] + 3]
                   - scene['data'].site(arm['site']).xpos)
@@ -575,9 +486,7 @@ class OctoPolicy:
             return {}
         d = np.asarray(self.delta_norms)
         g = np.asarray(self.grip_values)
-        # A grasp needs the hand to STAY closed. A gripper column that
-        # re-rolls every chunk is as fatal as one that never moves, and the
-        # frac-above-half number alone cannot tell the two apart.
+        # How often the gripper command flips between chunks.
         gc = np.asarray(self.grip_chunk_values) > 0.5
         flip = float((gc[1:] != gc[:-1]).mean()) if len(gc) > 1 else 0.0
         al = np.asarray(self.box_alignment) if self.box_alignment else np.zeros(0)
@@ -596,12 +505,7 @@ class OctoPolicy:
 
 
 def probe_actions(policy, scene, scene_xml, n_episodes, handover_only):
-    """Sample Octo actions with no IK and no physics, and report their scale.
-
-    The cheapest possible attribution step. If the deltas are ~0, or orders of
-    magnitude off, no amount of rollout debugging will help and the problem is
-    upstream of the bridge.
-    """
+    """Sample Octo actions with no IK and no physics, and report their scale."""
     model = scene['model']
     renderer = mujoco.Renderer(model, 256, 256)
     all_raw = []
@@ -613,9 +517,7 @@ def probe_actions(policy, scene, scene_xml, n_episodes, handover_only):
         else:
             reset_episode(scene, seed=ep)
         policy.reset()
-        # Query a few times from the start state without advancing physics.
-        # The observation window fills with repeats of the same frame, so this
-        # measures the action Octo commits to from a static scene.
+        # Query a few times from the static start state.
         for _ in range(5):
             all_raw.append(policy.raw_actions(scene, renderer))
 
@@ -663,8 +565,8 @@ def evaluate(
     n_episodes: int = 50,
     scene_xml: str = SCENE_XML,
     save_videos: bool = True,
-    video_dir: str = 'octo_eval_videos',
-    results_path: str = 'logs/octo_eval_results.json',
+    video_dir: str = str(RESULTS_DIR / 'videos'),
+    results_path: str = str(RESULTS_DIR / 'results.json'),
     max_control_steps: int = 350,
     video_camera: str = VIDEO_CAMERA,
     criterion: str = 'transfer',
@@ -676,10 +578,7 @@ def evaluate(
     assert criterion in CRITERIA, f'criterion must be one of {CRITERIA}'
     assert return_arm in ('a', 'b')
     assert arm_b_mode in ('hold', 'octo')
-    # Octo is a SINGLE-ARM policy: one camera, one instruction, one 7-d output.
-    # Two arms therefore need two independent instances. Sharing one would also
-    # share its observation window, so each chunk would push two frames into a
-    # window-2 buffer and both arms would be conditioned on one arm's camera.
+    # One Octo instance per arm: sharing one would share its observation window.
     assert not (arm_b_mode == 'octo' and policy_b is None), \
         'arm_b_mode="octo" needs a second OctoPolicy for arm B'
 
@@ -735,15 +634,15 @@ def evaluate(
         'a_touched_count': 0,
         'b_touched_count': 0,
         'skipped': 0,
-        # Recorded rather than inferred from the run tag: the start state is
-        # not recoverable from the numbers, and a tag-name heuristic silently
-        # mislabelled rows whose name did not end in _ho.
+        # Recorded rather than inferred from the run tag.
         'handover_only': bool(handover_only),
-        # Which block of episode seeds this run drew. Episodes are seeded
-        # seed_offset + ep_idx, exactly as cola_eval_aloha.py seeds them, so a
-        # row evaluated at the same offset scores the identical start states.
+        # Episodes are seeded seed_offset + ep_idx, as in eval_2arm.py.
         'seed_offset': int(seed_offset),
     }
+
+    # Octo emits absolute joint targets; the shared scoring block below also
+    # handles CoLA's velocity caches.
+    velocity_actions = False
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep_idx in tqdm(range(n_episodes), desc='Evaluating'):
@@ -775,9 +674,7 @@ def evaluate(
         max_box_z = 0.0
         max_handover_run = 0
         best_home_err = float('inf')
-        # Closest A's gripper site ever got to the box. On a pickup test this
-        # is the most informative single diagnostic: it separates "reached the
-        # box but did not close" from "never went near it".
+        # Closest approach of A's gripper to the box.
         min_a_box_dist = float('inf')
 
         while control_step < max_control_steps and not success and not dropped:
@@ -787,18 +684,25 @@ def evaluate(
             else:
                 chunk_b = hold_chunk(scene, scene['b'])
 
-            # Execute what the policies actually predicted. A head trained at
-            # action_horizon < CHUNK_SIZE (e.g. octo's native 4) returns a
-            # shorter chunk; indexing past it would crash, and padding it would
-            # replay a stale final pose. So re-query sooner instead. For every
-            # existing checkpoint (horizon 50) this is CHUNK_SIZE, unchanged.
+            # Execute only what was predicted; a shorter head means re-querying sooner.
             n_exec = min(len(chunk_a), len(chunk_b), CHUNK_SIZE)
             for k in range(n_exec):
                 if control_step >= max_control_steps:
                     break
 
-                apply_action(data, scene['a'], chunk_a[k])
-                apply_action(data, scene['b'], chunk_b[k])
+                if velocity_actions:
+                    # Velocity actions are deltas: add them to the current
+                    # joint positions, read fresh each step.
+                    step_a = chunk_a[k].copy()
+                    step_b = chunk_b[k].copy()
+                    step_a[:6] = data.qpos[scene['a']['qadr']] + step_a[:6]
+                    step_b[:6] = data.qpos[scene['b']['qadr']] + step_b[:6]
+                    # Column 6 is the gripper and was never differenced.
+                    apply_action(data, scene['a'], step_a)
+                    apply_action(data, scene['b'], step_b)
+                else:
+                    apply_action(data, scene['a'], chunk_a[k])
+                    apply_action(data, scene['b'], chunk_b[k])
 
                 for _ in range(CONTROL_DECIMATION):
                     compensate_gravity(model, data, subtrees)
@@ -819,11 +723,13 @@ def evaluate(
                     min_a_box_dist,
                     float(np.linalg.norm(data.site(scene['a']['site']).xpos - box_pos)))
 
+                # A has genuinely let go, not merely lost contact for a frame.
                 a_open = (float(data.qpos[scene['a']['finger_qadr']])
                           > GRIPPER_OPEN * GRIPPER_OPEN_FRAC)
                 b_has_box = b_holds and box_z > LIFT_Z
 
                 if not transfer_done:
+                    # Phase 1: transfer
                     if b_has_box and not a_holds and a_open:
                         handover_run += 1
                     else:
@@ -836,6 +742,8 @@ def evaluate(
                         if criterion == 'transfer':
                             success = True
                 else:
+                    # Phase 2: keep it (and optionally go home). The drop test
+                    # keys on contact: B may carry the box low on the way back.
                     no_contact_run = 0 if b_holds else no_contact_run + 1
                     if no_contact_run >= DROP_STEPS:
                         dropped = True
@@ -848,7 +756,7 @@ def evaluate(
                         home_run = home_run + 1 if home_err < HOME_TOL_RAD else 0
                         if home_run >= HOME_HOLD_STEPS:
                             success = True
-                    else:
+                    else:   # 'hold'
                         settle_run += 1
                         if settle_run >= SETTLE_STEPS:
                             success = True
@@ -913,13 +821,16 @@ def evaluate(
 
     results['summary'] = {
         'n_episodes': n_episodes,
+        # Episodes played: those whose start-state grasp failed are not scored.
         'n_scored': scored,
         'success_rate': 100.0 * results['task_successes'] / denom,
+        # Phase 1 only.
         'transfer_rate': 100.0 * results['transfer_count'] / denom,
         'drop_rate': 100.0 * results['drop_count'] / denom,
+        # Of the episodes that transferred, how many then lost the box.
         'drop_given_transfer': (100.0 * results['drop_count'] / len(transferred)
                                 if transferred else None),
-        # THE number this script exists to produce.
+        # Pick-up (the zero-shot Octo headline).
         'a_lift_rate': 100.0 * results['a_lifted_count'] / denom,
         'a_touch_rate': 100.0 * results['a_touched_count'] / denom,
         'b_touch_rate': 100.0 * results['b_touched_count'] / denom,
@@ -965,10 +876,7 @@ def evaluate(
         print(f"  gripper column: mean {d['gripper_raw_mean']:.3f}, "
               f"{d['gripper_raw_frac_above_half']*100:.0f}% above 0.5, "
               f"state flips on {d['gripper_chunk_flip_rate']*100:.0f}% of chunks")
-        # Total commanded PATH LENGTH over one episode, against the distance
-        # the gripper actually has to cover. Net displacement is always less
-        # than path, so a budget below the reach is a hard proof of failure
-        # that has nothing to do with Octo's competence.
+        # Commanded path length per episode vs. the distance the gripper must cover.
         budget = d['scaled_delta_mm_median'] / 1000.0 * max_control_steps
         print(f"  travel budget: {budget*100:.1f} cm of path over "
               f"{max_control_steps} control steps")
@@ -1074,9 +982,8 @@ if __name__ == '__main__':
     parser.add_argument('--probe-actions', action='store_true',
                         help='sample raw Octo actions with no IK and no physics, '
                              'report their scale, and exit. Run this FIRST.')
-    parser.add_argument('--video-dir', type=str, default='experiments/octo_baseline/videos')
-    parser.add_argument('--results-path', type=str,
-                        default='experiments/octo_baseline/logs/octo_eval_results.json')
+    parser.add_argument('--video-dir', type=str, default=str(RESULTS_DIR / 'videos'))
+    parser.add_argument('--results-path', type=str, default=str(RESULTS_DIR / 'results.json'))
     parser.add_argument('--max-control-steps', type=int, default=350)
     parser.add_argument('--criterion', choices=CRITERIA, default='transfer',
                         help='defaults to transfer here, not hold: a single-policy '
@@ -1087,12 +994,13 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--seed-offset', type=int, default=0,
                         help='shift the per-episode seeds by this amount, as '
-                             'cola_eval_aloha.py --seed-offset does. Episodes '
+                             'eval_2arm.py --seed-offset does. Episodes '
                              'are seeded seed_offset + ep_idx, so disjoint '
                              'offsets give independent evaluation sets of the '
                              'same policy. Distinct from --seed, which only '
                              "seeds the policy's own sampling.")
     args = parser.parse_args()
+    check_criterion()
 
     checkpoint = OCTO_CHECKPOINTS.get(args.octo_checkpoint, args.octo_checkpoint)
 
@@ -1123,9 +1031,7 @@ if __name__ == '__main__':
                       handover_only=args.handover_only)
         raise SystemExit(0)
 
-    # Arm B gets its OWN instance. Octo is single-arm -- one camera, one
-    # instruction, one 7-d output -- so a shared object would mean a shared
-    # observation window and both arms conditioned on arm A's view.
+    # Arm B gets its own Octo instance (separate observation window).
     policy_b = None
     if args.arm_b == 'octo':
         camera_b = args.camera_b
@@ -1143,8 +1049,7 @@ if __name__ == '__main__':
             gripper_open_high=not args.gripper_inverted,
             wrist_orientation=args.wrist_orientation,
             random_actions=args.random_actions,
-            # A different stream, so the two arms do not draw identical
-            # samples from identical observations.
+            # Different seed, so the arms don't draw identical samples.
             seed=args.seed + 1,
         )
 

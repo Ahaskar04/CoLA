@@ -1,19 +1,14 @@
-"""Finetune CoLA-on-pi0.5 on the hidden-marker handover.
+"""Finetune CoLA on pi0.5 on the hidden-marker handover.
 
-Budget and optimisation follow the two sides of the model:
-  * CoLA's run_marker_wristmsg budget: 20,250 steps at batch 128 (150 epochs x
-    135 steps over CoLA's own chunk starts), both arms per example, losses summed.
-  * pi0.5's parameters use openpi's LoRA recipe (pi0_libero_low_mem_finetune):
-    LoRA on both Gemma experts, the rest of the LLM frozen in bfloat16, SigLIP
-    and the action projections trainable; AdamW(0.9, 0.95), global clip 1.0,
-    warmup-cosine 2.5e-5 -> 2.5e-6.
-  * CoLA's channel (message encoders/decoders) uses CoLA's own optimiser
-    settings: Adam, 1e-4 cosine-decayed to 1e-5 over the run.
+  * Budget: CoLA's, 20,250 steps at batch 128 (150 epochs); both arms per
+    example, losses summed.
+  * pi0.5: openpi's LoRA recipe (LoRA on both Gemma experts, rest of the LLM
+    frozen in bfloat16; AdamW(0.9, 0.95), clip 1.0, warmup-cosine
+    2.5e-5 -> 2.5e-6).
+  * CoLA's channel: Adam, 1e-4 cosine-decayed to 1e-5.
 
-Batches of 128 are split into micro-batches and gradients accumulated, which is
-the same update as one batch of 128. Runs are split into time-limited segments
-(--time-limit-min) that save the full train state and resume bit-for-bit in the
-data order; a segment queued after the run has finished exits immediately.
+Batches are split into micro-batches with gradient accumulation. Training runs
+in time-limited segments (--time-limit-min) that resume exactly.
 """
 
 import argparse
@@ -28,7 +23,6 @@ import time
 
 _T0 = time.time()
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-os.environ.setdefault("OPENPI_DATA_HOME", "/scratch/users/ntu/ahaskar0/openpi_cache")
 
 import flax.nnx as nnx          # noqa: E402
 import flax.traverse_util as tu  # noqa: E402
@@ -41,13 +35,14 @@ import orbax.checkpoint as ocp  # noqa: E402
 import openpi.models.model as _model                  # noqa: E402
 import openpi.shared.nnx_utils as nnx_utils           # noqa: E402
 
-import cola_pi05_model as C     # noqa: E402
-import pi05_marker_data as D    # noqa: E402
+import cola_pi05_lora as C      # noqa: E402
+import pi05_data as D           # noqa: E402
 
-PI05_BASE = pathlib.Path(os.environ["OPENPI_DATA_HOME"]) / "openpi-assets/checkpoints/pi05_base/params"
+# pi0.5 base weights in openpi's download cache (~/.cache/openpi unless OPENPI_DATA_HOME is set).
+PI05_BASE = (pathlib.Path(os.environ.get("OPENPI_DATA_HOME", "~/.cache/openpi")).expanduser()
+             / "openpi-assets/checkpoints/pi05_base/params")
 
 
-# ----------------------------------------------------------------------------- model
 def build_model(config: C.ColaPi05Config, seed: int = 0, params_path=PI05_BASE):
     """pi0.5 base weights + fresh LoRA and CoLA channel; frozen weights in bfloat16."""
     abstract = nnx.eval_shape(config.create, jax.random.key(seed))
@@ -117,10 +112,8 @@ def param_report(trainable, frozen):
     return {"trainable": total_t, "cola_channel": cola, "lora": lora, "siglip": img, "frozen": count(frozen)}
 
 
-# ----------------------------------------------------------------------------- optimiser
 def make_optimizer(trainable, total_steps):
-    # openpi's CosineDecaySchedule (1000 warmup). Shortened only for runs too short to
-    # hold it (the smoke test), where optax would otherwise reject the schedule.
+    # openpi's warmup (1000 steps), shortened only for very short runs.
     warmup = min(1000, max(1, total_steps // 10))
     pi_lr = optax.warmup_cosine_decay_schedule(
         init_value=2.5e-5 / (warmup + 1), peak_value=2.5e-5, warmup_steps=warmup,
@@ -137,7 +130,6 @@ def make_optimizer(trainable, total_steps):
     ), {"pi": pi_lr, "cola": cola_lr}
 
 
-# ----------------------------------------------------------------------------- steps
 def to_device(np_batch, sharding=None):
     def obs(d):
         o = _model.Observation.from_dict({
@@ -191,7 +183,6 @@ def make_apply(tx):
     return apply
 
 
-# ----------------------------------------------------------------------------- checkpoint
 def save_tree(path: pathlib.Path, tree):
     tmp = path.with_name(path.name + ".tmp")
     if tmp.exists():
@@ -212,7 +203,6 @@ def pure(state):
     return state.to_pure_dict() if hasattr(state, "to_pure_dict") else state
 
 
-# ----------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True)

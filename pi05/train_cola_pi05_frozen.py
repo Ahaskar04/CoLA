@@ -1,50 +1,12 @@
-"""
-COLA training, v3: identical objective to v2, ~100x faster per step.
+"""Train CoLA's adapters on frozen pi0.5 features (hidden-marker task).
 
-v2 measured 3.8 it/s (0.36 s/step) on a 740K-parameter MLP consuming cached
-(128, 768) float32 arrays. That is dispatch overhead, not arithmetic. Three
-causes, all fixed here:
-
-1. NOTHING WAS JITTED. `jax.value_and_grad(loss_fn)` was called raw, so every
-   op in the forward, backward and optimizer update was dispatched individually
-   from Python. train_step() below fuses all four into one compiled function.
-
-2. NINE HOST SYNCS PER STEP. v2 did `float(loss)` plus `float(v)` for each of
-   the eight aux metrics, every step, each one blocking until the device caught
-   up. Metrics are now accumulated as device arrays and pulled once per epoch.
-
-3. A PREFETCH THREAD FOR DATA THAT FITS IN VRAM. The train split is
-   20170 x 768 x 4 bytes x 2 arms = 124 MB of features plus ~2 MB of actions
-   and states. DeviceDataset uploads all of it once and every batch becomes an
-   on-device gather -- no host transfer, no background thread, no locking.
-
-Also changed, all of it optional and off by default except where noted:
-
-  - EEMetric evaluates chunk steps 0 and CHUNK_SIZE-1 rather than all ten
-    (5x fewer mj_forward calls). Those are the two that matter: the gap
-    between them IS the chunk degradation. --ee_all_steps restores v2.
-  - gripper_transition_weights now sees one frame of left context, so a flip
-    landing on a chunk's first element is no longer invisible to it. With ~3
-    flips per 155-step episode you cannot afford to drop any. --no_grip_prev
-    restores v2 behaviour.
-  - Validation averages weighted by batch size instead of per-batch, so the
-    ragged final batch no longer counts as much as a full one.
-  - Checkpoints record cache_dir/feat_dir, and a rollout can assert it is
-    denormalising with the same action_stats.json the model was trained on.
-
-ASSUMPTIONS TO CHECK ONCE (they are asserted at startup, so a mismatch fails
-loudly rather than silently):
-  - features live at {feat_dir}/{split}_features_{a,b}.npy, shape (N, 768)
-  - actions  live at {cache_dir}/{split}_actions_{a,b}.npy, shape (N, 7)
-  - states   live at {cache_dir}/{split}_states_{a,b}.npy,  shape (N, 7)
-    (STATE_FILE_PATTERNS below tries a few spellings; add yours if it differs)
-  - COLADataset exposes .valid_starts, and within one episode those starts are
-    consecutive integers. Episode boundaries are recovered from the gaps and
-    cross-checked against the episode count COLADataset reports.
+Same trainer as train/train_2arm.py, using the pi0.5 model
+variant (cola_pi05_frozen.py) on the 2048-d features written by
+extract_pi05_features.py.
 
 Usage:
-    python train_handover_joint_h5_v3.py --use_proprio
-    python train_handover_joint_h5_v3.py --no_proprio --joint_mse --no_ee_weights
+    python train_cola_pi05_frozen.py --cache_dir CACHE --feat_dir FEATS --run_dir RUN \\
+        --lambda_gripper 0.25 --grip_transition_weight 0 --diffusion --diffusion_unet
 """
 
 import argparse
@@ -63,34 +25,28 @@ import numpy as np
 import optax
 from tqdm import tqdm
 
-# CoLA's own dataset module, unmodified, from the CoLA tree; the architecture
-# is the frozen-pi0.5 duplicate next to this file.
-sys.path.insert(0, '/scratch/users/ntu/ahaskar0/v1/cola-research-code/handover/cola')
+# CoLA's dataset module (repo root); the pi0.5 model variant sits next to this file.
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cola_architecture_pi05 import (COLAModel, GRIPPER_IDX, CHUNK_SIZE, ACTION_DIM,
-                                    DIFFUSION_STEPS)
-from cola_dataset import COLADataset
+from cola_pi05_frozen import (COLAModel, GRIPPER_IDX, CHUNK_SIZE, ACTION_DIM,
+                              DIFFUSION_STEPS)
+from cola.dataset import COLADataset
 
-CACHE_DIR = '/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_marker_v1'
-FEAT_DIR = '/scratch/users/ntu/ahaskar0/pi05_marker_features'
-SCENE_XML = '/home/users/ntu/ahaskar0/CoLA/environments/handover_2arm/scene.xml'
+CACHE_DIR = str(REPO / 'data' / 'cache' / 'handover_marker')
+FEAT_DIR = str(REPO / 'data' / 'features' / 'handover_marker_pi05')
+SCENE_XML = str(REPO / 'envs' / 'handover_2arm' / 'scene.xml')
+RUN_DIR = REPO / 'runs' / 'cola_pi05_frozen'
 
-# Millimetres of gripper travel per 1 std of each joint's action, measured with
-# forward kinematics over 150 poses drawn from the v2 dataset:
-#   waist 41, shoulder 223, elbow 335, forearm_roll 9, wrist_angle 111,
-#   wrist_rotate 0.3
-# Used as relative weights, then normalised to mean 1 so the joint term keeps
-# its scale against LAMBDA_GRIPPER.
-#
-# forearm_roll and wrist_rotate are floored at 0.25 rather than used raw: the
-# measurement tracks the gripper SITE POSITION only, so it scores wrist rotation
-# at ~0, but rotation still decides whether the jaws line up with the box.
+# Per-joint loss weights: gripper displacement per 1 std of each joint's action
+# (forward kinematics), normalised to mean 1. The two wrist-rotation joints are
+# floored at 0.25: they barely move the gripper but still align the jaws.
 JOINT_EE_WEIGHTS = np.array([0.34, 1.86, 2.79, 0.25, 0.93, 0.25], dtype=np.float32)
 JOINT_EE_WEIGHTS = JOINT_EE_WEIGHTS / JOINT_EE_WEIGHTS.mean()
 
 ARM_JOINTS = ['waist', 'shoulder', 'elbow', 'forearm_roll', 'wrist_angle', 'wrist_rotate']
 
-# prepare_states_h5.py's output naming was not visible when this was written.
+# Accepted file names for cached states.
 STATE_FILE_PATTERNS = ('{split}_states_{arm}.npy',
                        '{split}_state_{arm}.npy',
                        '{split}_proprio_{arm}.npy')
@@ -130,7 +86,7 @@ def setup_logging(log_dir, timestamp):
     logger = logging.getLogger('cola_train_v3')
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    logger.propagate = False   # v2 double-printed every line via the root logger
+    logger.propagate = False   # avoid duplicate lines via the root logger
 
     file_handler = logging.FileHandler(log_path)
     file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s',
@@ -164,9 +120,7 @@ def plot_loss_curves(train_losses, val_losses, best_epoch, save_path):
     plt.close(fig)
 
 
-# --------------------------------------------------------------------------
 # Device-resident dataset
-# --------------------------------------------------------------------------
 
 def _find_state_files(cache_dir, split):
     """Locate the cached proprioception arrays, whatever they are called."""
@@ -180,16 +134,14 @@ def _find_state_files(cache_dir, split):
     raise SystemExit(
         f'use_proprio=True but no state arrays found in {cache_dir} for split '
         f'{split!r}.\n  tried: {tried}\n  present: {found}\n'
-        f'Run prepare_states_h5.py, or add the right name to STATE_FILE_PATTERNS.'
+        f'Run prepare_states_2arm.py, or add the right name to STATE_FILE_PATTERNS.'
     )
 
 
 class DeviceDataset:
-    """Whole split resident in device memory; batches are on-device gathers.
+    """Whole split held in device memory; batches are on-device gathers.
 
-    Reuses COLADataset only for .valid_starts, which encodes the episode-boundary
-    logic (a chunk must not straddle two episodes). Everything else is loaded
-    straight from the .npy files so no host->device copy happens per batch.
+    COLADataset is used only for .valid_starts (chunks never straddle episodes).
     """
 
     def __init__(self, cache_dir, feat_dir, split, use_proprio,
@@ -206,15 +158,14 @@ class DeviceDataset:
         cache_dir, feat_dir = Path(cache_dir), Path(feat_dir)
         feat_a = np.load(feat_dir / f'{split}_features_a.npy')
         feat_b = np.load(feat_dir / f'{split}_features_b.npy')
-        # One fixed third-person view, shared by both arms. Written only by
-        # extract_features_h5.py --overhead.
+        # Shared overhead view (optional).
         feat_o = None
         if use_overhead:
             fo = feat_dir / f'{split}_features_o.npy'
             if not fo.exists():
                 raise FileNotFoundError(
                     f'{fo} not found. --overhead needs the overhead features: '
-                    f're-run extract_features_h5.py --overhead after deleting '
+                    f're-run extract_features_2arm.py --overhead after deleting '
                     f'the feature dir (it skips when files already exist).')
             feat_o = np.load(fo)
         act_a = np.load(cache_dir / f'{split}_actions_a.npy')
@@ -228,9 +179,8 @@ class DeviceDataset:
         assert starts_np.max() + chunk_size <= n, \
             f'{split}: chunk start {starts_np.max()} + {chunk_size} overruns {n} rows'
 
-        # Within an episode the valid starts are consecutive integers, so a gap
-        # marks an episode boundary. Used to give the gripper-flip mask one frame
-        # of left context without reading across an episode seam.
+        # A gap in the valid starts marks an episode boundary. prev gives the
+        # gripper-flip mask one frame of left context within the episode.
         is_ep_start = np.concatenate([[True], np.diff(starts_np) != 1])
         prev_np = np.where(is_ep_start, starts_np, starts_np - 1).astype(np.int32)
         self.n_episodes = int(is_ep_start.sum())
@@ -291,22 +241,14 @@ class DeviceDataset:
             yield self.batch(order[i:i + batch_size])
 
 
-# --------------------------------------------------------------------------
-# Loss  (identical objective to v2)
-# --------------------------------------------------------------------------
+# Loss
 
 def gripper_transition_weights(target_chunk, extra_weight, prev_label=None):
-    """Weight gripper frames by proximity to a state change.
+    """Per-frame gripper loss weights, raised near open/close transitions.
 
-    target_chunk: (batch, chunk, action_dim), gripper column is +/-0.9.
-    Only ~1.9% of timesteps flip the gripper, so an unweighted mean is dominated
-    by frames where holding the previous value is already correct. Widened by
-    one step either side so the TIMING is supervised, not just the exact frame.
-
-    prev_label: (batch,) 0/1 gripper label of the frame BEFORE the chunk. v2
-    used jnp.diff inside the chunk alone, which cannot see a flip landing on
-    element 0 -- the comparison frame is outside the window. Passing it in
-    recovers those.
+    Frames within +/-1 step of a flip get 1 + extra_weight. prev_label
+    (batch,) is the gripper label just before the chunk, so a flip on the
+    chunk's first element is still caught.
     """
     label = (target_chunk[..., GRIPPER_IDX] > 0).astype(jnp.float32)   # (B, C)
 
@@ -336,8 +278,6 @@ def make_loss_fn(model, cfg):
     joint_l1 = cfg['joint_l1']
     grip_prev = cfg['grip_prev_context']
     p_drop = cfg['proprio_dropout']
-    # cfg, not a closure over train_cola's locals: compute_loss is nested in
-    # make_loss_fn, which is a separate function and cannot see them.
     use_messages = cfg.get('use_messages', True)
 
     def _diffusion_loss(model, params, cond_a, cond_b, batch, rng,
@@ -346,8 +286,7 @@ def make_loss_fn(model, cfg):
         ab = model.alpha_bars
         total = 0.0
         parts = {}
-        # Validation passes rng=None; use a fixed key so val loss is comparable
-        # across epochs rather than varying with the noise draw.
+        # Validation passes rng=None; a fixed key keeps val loss comparable.
         base = rng if rng is not None else jax.random.PRNGKey(0)
 
         for tag, cond, target in (('a', cond_a, batch['action_a']),
@@ -364,9 +303,7 @@ def make_loss_fn(model, cfg):
 
             eps_pred, grip_logit = model.denoise(cond, noisy, t, params, tag)
 
-            # MSE on the noise: the standard DDPM parameterisation, better
-            # conditioned than predicting the action directly because the
-            # target is always unit-scale.
+            # Standard DDPM noise-prediction loss.
             joint_loss = jnp.mean((eps_pred - noise) ** 2)
 
             label = (target[..., GRIPPER_IDX] > 0).astype(jnp.float32)
@@ -389,9 +326,7 @@ def make_loss_fn(model, cfg):
         state_a = batch['state_a'] if use_proprio else None
         state_b = batch['state_b'] if use_proprio else None
 
-        # Randomly blank the proprio input so the head cannot lean on it to the
-        # exclusion of vision (causal confusion). Train only -- rng is None at
-        # validation.
+        # Proprio dropout (training only), so the policy can't ignore vision.
         if use_proprio and rng is not None and p_drop > 0:
             k1, k2 = jax.random.split(rng)
             keep_a = (jax.random.uniform(k1, (state_a.shape[0], 1)) >= p_drop)
@@ -403,26 +338,14 @@ def make_loss_fn(model, cfg):
             batch['features_a'], batch['features_b'],
             params=params, proprio_a=state_a, proprio_b=state_b,
             features_o=batch.get('features_o'),
-            # L0 / no-coordination ablation. The encoders and decoders still
-            # exist and still take gradients -- only the message CONTENT is
-            # zeroed -- so parameter count is unchanged and this isolates
-            # communication rather than capacity. The EE-metric call below
-            # passes the same flag; if the two disagree the reported metric
-            # describes a differently-wired model than the loss trains.
+            # False zeros message content only, so the parameter count is
+            # unchanged (no-message ablation).
             use_messages=use_messages,
         )
 
         if model.use_diffusion:
-            # Under diffusion, forward_from_features returns the CONDITIONING
-            # vectors, not actions. Train the denoiser: corrupt the expert's
-            # joint chunk to a random noise level and have the head predict the
-            # noise that was added. Nothing is regressed toward an action, so
-            # two valid ways round the box stay two modes instead of averaging
-            # into a reach through the middle.
-            #
-            # The gripper column never enters the diffusion -- it is binary, and
-            # regressing it is the bug that once left the hand permanently shut.
-            # The head emits it as a logit and it keeps the same BCE term below.
+            # Diffusion: forward_from_features returned conditioning vectors.
+            # Train the denoiser on the joints; the gripper keeps its BCE logit.
             return _diffusion_loss(model, params, pred_a, pred_b, batch, rng,
                                    lam, trans_w, grip_prev)
 
@@ -432,12 +355,12 @@ def make_loss_fn(model, cfg):
                                   ('b', pred_b, batch['action_b'])):
             target = jnp.asarray(target)
 
-            # --- joints: weighted by how much each moves the gripper ---
+            # Joints: weighted by how much each moves the gripper
             err = pred[..., :GRIPPER_IDX] - target[..., :GRIPPER_IDX]
             err = jnp.abs(err) if joint_l1 else err ** 2
             joint_loss = (err * w_joint).mean()
 
-            # --- gripper: binary, so BCE on a raw logit ---
+            # Gripper: binary, so BCE on a raw logit
             label = (target[..., GRIPPER_IDX] > 0).astype(jnp.float32)
             bce = optax.sigmoid_binary_cross_entropy(pred[..., GRIPPER_IDX], label)
             prev = batch[f'prev_grip_{tag}'] if grip_prev else None
@@ -447,7 +370,7 @@ def make_loss_fn(model, cfg):
             total = total + joint_loss + lam * grip_loss
             parts[f'joint_{tag}'] = joint_loss
             parts[f'grip_{tag}'] = grip_loss
-            # Accuracy on the frames that actually decide the task.
+            # Accuracy overall and near gripper transitions.
             correct = ((pred[..., GRIPPER_IDX] > 0) == (label > 0.5)).astype(jnp.float32)
             flip_mask = gw > 1.0
             parts[f'grip_acc_{tag}'] = correct.mean()
@@ -460,17 +383,12 @@ def make_loss_fn(model, cfg):
     return compute_loss
 
 
-# --------------------------------------------------------------------------
 # Compiled train step
-# --------------------------------------------------------------------------
 
 def make_train_step(loss_fn, optimizer):
-    """One compiled function: forward, backward, optimizer update.
+    """Jitted train step: forward, backward and optimizer update.
 
-    donate_argnums lets XLA write the new params and opt_state over the old
-    buffers instead of allocating fresh ones. The donated inputs are invalid
-    after the call, so nothing may hold another reference to them -- in
-    particular model.params is only rebound between epochs, never read during.
+    params and opt_state are donated, so the inputs are invalid after the call.
     """
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
@@ -485,22 +403,13 @@ def make_train_step(loss_fn, optimizer):
     return train_step
 
 
-# --------------------------------------------------------------------------
 # End-effector error, in millimetres
-# --------------------------------------------------------------------------
 
 class EEMetric:
-    """Median gripper-position error of the predicted joint targets, in mm.
+    """Median gripper-position error (mm) of predicted vs. true joint targets.
 
-    The loss is in normalised units and does not say whether the policy can hit
-    a box. This does: it denormalises the predicted and true joint targets and
-    measures how far apart the two put the gripper.
-
-    v2 ran mj_forward on every one of the 10 chunk steps, for both pred and
-    true, for 256 samples -- 5120 FK calls in a Python loop, every epoch. Once
-    the training step is compiled that dominates the epoch. Steps 0 and
-    CHUNK_SIZE-1 answer the same question: the spread between them IS the chunk
-    degradation.
+    Forward kinematics on denormalised actions, at chunk steps 0 and N-1
+    (every step with all_steps=True).
     """
 
     def __init__(self, cache_dir, scene_xml, n_samples=256, all_steps=False):
@@ -514,10 +423,7 @@ class EEMetric:
         self.data = mujoco.MjData(self.model)
         self.qadr = [self.model.joint(f'left/{n}').qposadr[0] for n in ARM_JOINTS]
         self.key = self.model.key('neutral_pose').id
-        # A velocity cache stores per-step DELTAS. Writing those straight into
-        # qpos would put the arm at "0.03 rad from the origin" rather than
-        # "current pose + 0.03", making the metric meaningless. Both pred and
-        # true get the same treatment, so the comparison stays fair either way.
+        # Velocity caches store per-step deltas; see _ee.
         self.velocity = bool(self.stats.get('velocity', False))
         mujoco.mj_resetDataKeyframe(self.model, self.data, self.key)
         self.home_q = self.data.qpos[self.qadr].copy()
@@ -530,9 +436,7 @@ class EEMetric:
 
     def _ee(self, q):
         self.mujoco.mj_resetDataKeyframe(self.model, self.data, self.key)
-        # Deltas are measured from the home pose: without the true starting
-        # configuration (which the cached features do not carry) this is the
-        # one reference both pred and true can share.
+        # Deltas are applied from the home pose, the one reference both share.
         self.data.qpos[self.qadr] = (self.home_q + q) if self.velocity else q
         self.mujoco.mj_forward(self.model, self.data)
         return self.data.site('left/gripper').xpos.copy()
@@ -564,9 +468,7 @@ class EEMetric:
         }
 
 
-# --------------------------------------------------------------------------
 # Train / validate
-# --------------------------------------------------------------------------
 
 def train_epoch(train_step, params, opt_state, dataset, rng, batch_size,
                 epoch_num, num_epochs, progress_file=None):
@@ -585,7 +487,7 @@ def train_epoch(train_step, params, opt_state, dataset, rng, batch_size,
         acc = {'loss': loss, **parts}
         sums = acc if sums is None else jax.tree_util.tree_map(jnp.add, sums, acc)
 
-        # One sync per 100 steps, for the PBS progress file only.
+        # Progress file, updated every 100 steps.
         if progress_file is not None and batch_idx % 100 == 0:
             with open(progress_file, 'w') as pf:
                 pf.write(f'Epoch {epoch_num+1}/{num_epochs} | Batch {batch_idx}/{n_batches} '
@@ -599,12 +501,7 @@ def train_epoch(train_step, params, opt_state, dataset, rng, batch_size,
 
 def validate(loss_fn_jit, params, dataset, batch_size, model=None, ee_metric=None,
              use_proprio=False, use_messages=True):
-    """Deterministic sweep over every valid chunk-start.
-
-    Walks the split in order so the number is repeatable. Unlike v2 this
-    weights each batch by its size, so the ragged final batch does not count
-    as much as a full one.
-    """
+    """Deterministic pass over every valid chunk start, weighted by batch size."""
     sums, total_n = None, 0
     pred_acc, true_acc = [], []
 
@@ -622,14 +519,10 @@ def validate(loss_fn_jit, params, dataset, batch_size, model=None, ee_metric=Non
                 proprio_a=batch.get('state_a') if use_proprio else None,
                 proprio_b=batch.get('state_b') if use_proprio else None,
                 features_o=batch.get('features_o'),
-                # Must match the loss path's setting -- see the note there.
+                # Same setting as the loss.
                 use_messages=use_messages)
             if model.use_diffusion:
-                # Under diffusion forward_from_features returns CONDITIONING,
-                # not actions -- feeding that straight to the EE metric would
-                # silently measure the wrong tensor. Sample an actual chunk.
-                # Fixed key so the metric is comparable across epochs rather
-                # than moving with the noise draw.
+                # Diffusion returns conditioning: sample a chunk (fixed key).
                 pa = model.sample_actions(out_a, params, 'a',
                                           jax.random.PRNGKey(0))
             else:
@@ -650,8 +543,8 @@ def train_cola(
     num_epochs=150,
     learning_rate=1e-4,
     batch_size=128,
-    checkpoint_dir='experiments/run_aloha_handover_v3/checkpoints',
-    log_dir='experiments/run_aloha_handover_v3/logs',
+    checkpoint_dir=str(RUN_DIR / 'checkpoints'),
+    log_dir=str(RUN_DIR / 'logs'),
     use_proprio=True,
     use_overhead=False,
     proprio_dropout=0.1,
@@ -691,9 +584,7 @@ def train_cola(
         'use_diffusion': use_diffusion,
         'use_messages': use_messages,
         'diffusion_unet': diffusion_unet,
-        # Recorded even when None: the eval rebuilds the head from this, and a
-        # checkpoint trained at (64,128) loaded into a (128,256) head is a
-        # parameter-shape error, not a silent degradation.
+        # Recorded even when None; eval rebuilds the head from it.
         'unet_dims': list(unet_dims) if unet_dims else None,
     }
 
@@ -719,8 +610,7 @@ def train_cola(
     test_dataset = DeviceDataset(cache_dir, feat_dir, 'test', use_proprio, logger=logger,
                   use_overhead=use_overhead)
 
-    # The gripper head can hit high accuracy by learning the class prior alone.
-    # Log the prior so the training numbers can be read against the right baseline.
+    # Gripper class prior: the baseline for gripper accuracy.
     grip_train = np.asarray(jax.device_get(train_dataset.act_a[:, GRIPPER_IDX]))
     prior = float((grip_train > 0).mean())
     logger.info(f'  gripper class balance (arm A, train): {prior:.3f} open / '
@@ -812,23 +702,14 @@ def train_cola(
                 'epoch': epoch,
                 'train_loss': tr['loss'],
                 'val_loss': va['loss'],
-                # A rollout must know how the checkpoint was built: whether to
-                # feed it proprio, and that column 6 is a logit not a position.
+                # Build flags the evaluator needs to rebuild the model.
                 'use_proprio': use_proprio,
-                # self_dim is 768 larger when overhead is on, so a rollout that
-                # rebuilds the model without this flag gets 832-dim params and
-                # fails to load 1600-dim weights.
                 'use_overhead': use_overhead,
                 'split_gripper': True,
-                # TOP LEVEL deliberately: cola_eval_aloha.py reads
-                # ckpt.get('use_messages', True) from here, not from config, to
-                # refuse evaluating a severed checkpoint with messages on. Left
-                # only in cfg, that guard is blind.
+                # Top level, so the evaluator can refuse a mismatched message setting.
                 'use_messages': use_messages,
                 'config': cfg,
-                # Provenance. cola_eval_aloha.py defaults to the v1 cache; if it
-                # denormalises with different action_stats.json the arm goes to a
-                # systematically wrong pose and nothing errors. Assert on load.
+                # Data provenance.
                 'cache_dir': str(cache_dir),
                 'feat_dir': str(feat_dir),
             }
@@ -906,7 +787,7 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Train COLA adapters, jitted.')
     ap.add_argument('--cache_dir', default=CACHE_DIR)
     ap.add_argument('--feat_dir', default=FEAT_DIR)
-    ap.add_argument('--run_dir', default='experiments/run_aloha_handover_v4')
+    ap.add_argument('--run_dir', default=str(RUN_DIR))
     ap.add_argument('--scene_xml', default=SCENE_XML)
     ap.add_argument('--num_epochs', type=int, default=150)
     ap.add_argument('--learning_rate', type=float, default=1e-4)
@@ -916,7 +797,7 @@ if __name__ == '__main__':
     ap.add_argument('--overhead', action='store_true',
                     help="concatenate the shared overhead-camera features onto "
                          "both arms' self-representation (self_dim 768 -> 1536). "
-                         "Requires extract_features_h5.py --overhead.")
+                         "Requires extract_features_2arm.py --overhead.")
     ap.add_argument('--no_proprio', action='store_true',
                     help='ablation: train without state_a/state_b')
     ap.add_argument('--proprio_dropout', type=float, default=0.1,
@@ -1001,6 +882,6 @@ if __name__ == '__main__':
     print('\n' + '=' * 60)
     print('READY FOR ENVIRONMENT EVALUATION')
     print('=' * 60)
-    print('Next: python cola_eval_aloha.py '
-          '--model experiments/run_aloha_handover_v4/checkpoints/best_model.pkl '
-          '--cache-dir <the SAME cache_dir this was trained on>')
+    print('Next: python pi05/eval_cola_pi05_frozen.py '
+          f'--model {args.run_dir}/checkpoints/best_model.pkl '
+          '--cache-dir <the SAME cache_dir this was trained on> --results-path OUT.json')

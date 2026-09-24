@@ -1,29 +1,13 @@
-"""
-COLA rollout evaluation on the ALOHA handover task.
+"""Evaluate a two-arm CoLA checkpoint on the ALOHA handover task.
 
-Success is scored in two phases, with three selectable end conditions:
+Transfer: B alone holds the lifted box and A's gripper is open. The end
+condition is set by --criterion:
+    transfer  score at the transfer
+    hold      (default) B also keeps the box for SETTLE_STEPS
+    return    B also brings its arm back to the neutral pose while holding
 
-  1. TRANSFER (always) — B alone holds the lifted box and A has actually opened
-     its gripper. Absence of contact alone is not enough: a finger pad grazing
-     the box while A is still closed reads as "not holding".
-
-  2. End condition, --criterion:
-       transfer  score at the transfer. The criterion used in the CoRL
-                 submission; transfer_rate == success_rate.
-       hold      (default) B must keep the box for SETTLE_STEPS after the
-                 transfer. Catches the episode where B takes the box and
-                 immediately drops it, which `transfer` counts as a success.
-       return    B must additionally bring its arm back within HOME_TOL_RAD of
-                 the neutral pose while still holding.
-
-transfer_rate is reported under every criterion, so numbers stay comparable
-with earlier runs and with the paper.
-
-The drop test keys on CONTACT, not height: B may legitimately carry the box low
-on its way back, and box_z < LIFT_Z there is not a drop.
-
-IMPORTANT: expert_replay.py mirrors this file's control loop and criterion. If
-you change one, change the other, or the replay stops being the same test.
+transfer_rate is reported under every criterion. Drops are detected by loss
+of contact, not by height.
 """
 
 import os
@@ -32,6 +16,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import argparse
 import json
 import pickle
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -40,55 +25,45 @@ import mujoco
 import numpy as np
 from tqdm import tqdm
 
-from cola_architecture import COLAModel, CHUNK_SIZE
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from cola.model import COLAModel, CHUNK_SIZE  # noqa: E402
 
-SCENE_XML = '/home/users/ntu/ahaskar0/CoLA/environments/handover_2arm/scene.xml'
-CACHE_DIR = '/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_aloha_handover'
+SCENE_XML = str(REPO / 'envs' / 'handover_2arm' / 'scene.xml')
+CACHE_DIR = str(REPO / 'data' / 'cache' / 'handover_2arm')
+EXPERT_DIR = str(REPO / 'data_collection' / 'handover_2arm')
+RESULTS_DIR = REPO / 'results' / 'eval_2arm'
 
-# Demos stored every 10th sim step (collect_demos.py record_every_n_steps=10).
+# Demos were recorded every 10th sim step.
 CONTROL_DECIMATION = 10
 
-# Box spawn ranges used by scripted_policy.py — NOT the wider ones in env.py.
+# Box spawn ranges from scripted_policy.py.
 BOX_X_RANGE = (-0.12, 0.12)
 BOX_Y_RANGE = (-0.10, 0.10)
 BOX_SPAWN_HEIGHT = 0.03
-# Handover-only start offsets, matching scripted_policy.run_episode's
-# handover_only branch. Evaluating on a different spread than training saw
-# would measure distribution shift rather than policy quality.
+# Handover-only start offsets; must match scripted_policy.py's handover_only branch.
 HO_Y_RANGE = 0.10
 HO_Z_RANGE = 0.06
 
 ARM_JOINTS = ['waist', 'shoulder', 'elbow', 'forearm_roll', 'wrist_angle', 'wrist_rotate']
 
-# Camera used for the saved rollout videos. A side-on view shows lift height and
-# the A->B transfer, which the top-down overhead_cam flattens away.
-# Options: teleoperator_pov (side, front), collaborator_pov (side, rear),
-#          overhead_cam (top-down), worms_eye_cam (low angle).
+# Camera for rollout videos (others: collaborator_pov, overhead_cam, worms_eye_cam).
 VIDEO_CAMERA = 'teleoperator_pov'
 
-# Gripper actuator endpoints, matching utils.py in the collection code. Used
-# when the checkpoint emits a gripper logit rather than a position.
+# Gripper actuator endpoints (as in the collection utils), used for logit heads.
 GRIPPER_OPEN = 0.037
 GRIPPER_CLOSED = 0.002
 
-# --------------------------------------------------------------------------
-# Criterion constants. expert_replay.py carries identical values.
-# --------------------------------------------------------------------------
+# Success-criterion constants
 # Box counts as lifted well clear of the table (it rests at z ~ 0.03).
 LIFT_Z = 0.10
-# Consecutive control steps the transfer condition must hold, so a one-frame
-# contact glitch cannot score.
+# Consecutive control steps the transfer condition must hold.
 HOLD_STEPS = 5
 # --criterion hold: control steps B must keep the box after the transfer.
-# The demos leave only ~25-35 steps after the transfer completes, so a window
-# much larger than this is unpassable by the demonstrations themselves. Verify
-# with expert_replay.py --success-criterion hold before raising it.
 SETTLE_STEPS = 20
-# Consecutive steps with no B-box contact that count as a drop. Contact
-# flickers, so one missing frame is not a drop.
+# Consecutive no-contact steps that count as a drop (contact flickers).
 DROP_STEPS = 3
-# --criterion return: the returning arm is home when every one of its joints is
-# within this many radians of the neutral keyframe.
+# --criterion return: every joint within this many radians of the neutral pose.
 HOME_TOL_RAD = 0.10
 # Consecutive steps it must hold that pose while still holding the box.
 HOME_HOLD_STEPS = 5
@@ -99,13 +74,7 @@ CRITERIA = ('transfer', 'hold', 'return')
 
 
 def build_scene(xml_path: str) -> Dict:
-    """Load the scene and cache every id the rollout needs.
-
-    Deliberately does not import CoLA's utils.setup_dual_arm_ik: that pulls in
-    mink/loop_rate_limiters for the scripted policy's IK, which a learned
-    policy has no use for (it emits joint targets directly) and which are not
-    installed in this venv.
-    """
+    """Load the scene and cache every id the rollout needs (no IK)."""
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
 
@@ -114,24 +83,22 @@ def build_scene(xml_path: str) -> Dict:
             'actuators': np.array([model.actuator(f'{prefix}/{n}').id for n in ARM_JOINTS]),
             'gripper_actuator': model.actuator(f'{prefix}/gripper').id,
             'subtree': model.body(f'{prefix}/base_link').id,
-            # Same layout collect_demos.py recorded as state_a/state_b:
-            # six arm joint positions, then the left finger position.
+            # Same layout as the recorded states: six joints, then the left finger.
             'qadr': np.array([model.joint(f'{prefix}/{n}').qposadr[0] for n in ARM_JOINTS]),
             'finger_qadr': model.joint(f'{prefix}/left_finger').qposadr[0],
-            # Both finger pads, left and right. CoLA's
-            # check_gripper_box_contact_right lists right/right_g* twice and
-            # omits right/left_g*, so it misses contacts on one pad.
+            # Both finger pads.
             'finger_geoms': {
                 model.geom(f'{prefix}/{side}_g{i}').id
                 for side in ('left', 'right') for i in range(3)
             },
+            # Gripper site, for the closest-approach diagnostic.
+            'site': f'{prefix}/gripper',
         }
 
     a, b = arm('left'), arm('right')
     neutral_key = model.key('neutral_pose').id
 
-    # Home configurations, read from the same keyframe reset_episode restores at
-    # the start of every episode. Both are kept so --return-arm can pick either.
+    # Home poses from the neutral keyframe; --return-arm picks which arm returns.
     mujoco.mj_resetDataKeyframe(model, data, neutral_key)
     home_qpos_a = data.qpos[a['qadr']].copy()
     home_qpos_b = data.qpos[b['qadr']].copy()
@@ -169,12 +136,7 @@ def load_action_stats(cache_dir: str):
 
 
 def load_state_normaliser(cache_dir: str):
-    """Return a callable that z-scores a raw joint state, or None if unavailable.
-
-    Must use the same stats prepare_states_h5.py fitted on the train split;
-    normalising a rollout with anything else silently shifts the input
-    distribution the policy was trained on.
-    """
+    """Return a callable that z-scores a joint state (train-split stats), or None."""
     path = Path(cache_dir) / 'state_stats.json'
     if not path.exists():
         return None
@@ -223,37 +185,27 @@ _HO_SETUP = None
 
 
 def _handover_setup(scene_xml: str):
-    """Lazily build the scripted expert's IK rig, reused across episodes.
+    """Build the expert's IK rig once (used only to construct the start state).
 
-    build_scene() deliberately skips mink because a learned policy emits joint
-    targets directly. The handover-only START STATE, though, is produced by IK:
-    the box is held by contact, so it cannot be repositioned by writing qpos --
-    the closed fingers drag it back to equilibrium between the pads. The arm has
-    to move and carry it. Importing the expert's own setup here means eval and
-    collect_demos.py construct that state with the same code rather than two
-    implementations that can drift apart.
+    The held box can't be placed by writing qpos, so the start state is reached
+    with the expert's own IK, as in collect_demos.py.
     """
     global _HO_SETUP
     if _HO_SETUP is None:
-        import sys
-        sys.path.insert(0, '/home/users/ntu/ahaskar0/CoLA/data_collection/handover_2arm')
+        sys.path.insert(0, EXPERT_DIR)
         from utils import setup_dual_arm_ik
         _HO_SETUP = setup_dual_arm_ik(scene_xml)
     return _HO_SETUP
 
 
 def reset_episode_handover(scene, seed: int, scene_xml: str):
-    """Start with arm A already holding the box, as the training demos do.
+    """Start with arm A holding the box, as in the training demos.
 
-    Mirrors the handover_only branch of scripted_policy.run_episode(): load the
-    handover_start keyframe, offset A's gripper by the SAME y/z ranges the
-    dataset was collected with, settle, and verify the grasp survived. Returns
-    False if it did not, so the caller can skip rather than score an episode
-    that began with an empty gripper.
+    Mirrors scripted_policy.py's handover_only branch (same y/z offsets).
+    Returns False if the grasp didn't survive, so the episode can be skipped.
     """
     import mink
-    # _handover_setup puts the expert's directory on sys.path, so `utils` is
-    # only importable after it has run.
+    # utils is importable only after _handover_setup adds the expert dir to sys.path.
     su = _handover_setup(scene_xml)
     from utils import check_gripper_box_contact
     m, d = su['model'], su['data']
@@ -264,8 +216,7 @@ def reset_episode_handover(scene, seed: int, scene_xml: str):
     mujoco.mj_resetDataKeyframe(m, d, m.key('handover_start').id)
     mujoco.mj_forward(m, d)
     grip0 = d.site('left/gripper').xpos.copy()
-    # Same ranges as scripted_policy.run_episode: x fixed (the arms always meet
-    # at the same point along the axis between them), y/z randomised.
+    # Same ranges as scripted_policy.py: x fixed, y/z randomised.
     offset = np.array([0.0,
                        rng.uniform(-HO_Y_RANGE, HO_Y_RANGE),
                        rng.uniform(-HO_Z_RANGE, HO_Z_RANGE)])
@@ -329,8 +280,8 @@ def evaluate_cola(
     scene_xml: str = SCENE_XML,
     cache_dir: str = CACHE_DIR,
     save_videos: bool = True,
-    video_dir: str = 'evaluation_videos',
-    results_path: str = 'logs/cola_eval_aloha_results.json',
+    video_dir: str = str(RESULTS_DIR / 'videos'),
+    results_path: str = str(RESULTS_DIR / 'results.json'),
     max_control_steps: int = 350,
     use_messages: bool = True,
     video_camera: str = VIDEO_CAMERA,
@@ -364,46 +315,36 @@ def evaluate_cola(
     with open(model_path, 'rb') as f:
         ckpt = pickle.load(f)
 
-    # Build the model the way the checkpoint was trained. Getting either flag
-    # wrong fails silently rather than loudly: the wrong proprio setting is a
-    # parameter-shape error, but a tanh-vs-logit mismatch on the gripper just
-    # produces a policy that never opens its hand.
+    # Rebuild the model with the flags it was trained with.
     use_proprio = bool(ckpt.get('use_proprio', False))
-    # Must match how the checkpoint was trained: overhead adds a second
-    # FEATURE_DIM block to self_dim (768 -> 1536), so rebuilding without it
-    # produces params of the wrong shape and the weights will not load.
     use_overhead = bool(ckpt.get('use_overhead', False))
+    use_wrist = bool(ckpt.get('use_wrist', ckpt.get('config', {}).get('use_wrist', True)))
     split_gripper = bool(ckpt.get('split_gripper', False))
-    # Diffusion checkpoints carry a denoiser whose params have a different shape
-    # AND a different call signature, so the flag has to come from the file
-    # rather than a CLI switch -- building the wrong head fails to load.
+    # Diffusion checkpoints need a different head, so the flag comes from the checkpoint.
     use_diffusion = bool(ckpt.get('config', {}).get('use_diffusion', False))
-    # Set by prepare_h5_handover.py --velocity. Getting this wrong is silent:
-    # deltas written as absolute targets send the arm to a pose near the
-    # origin on step 1, and absolute targets integrated as deltas run away.
+    # Velocity caches (prepare_cache_2arm.py --velocity) store deltas, not targets.
     with open(Path(cache_dir) / 'action_stats.json') as _f:
         velocity_actions = bool(json.load(_f).get('velocity', False))
     if velocity_actions:
         print('   action space: VELOCITY (deltas integrated onto the current pose)')
     diffusion_unet = bool(ckpt.get('config', {}).get('diffusion_unet', False))
-    # Capacity ablation: a checkpoint trained at (64,128) rebuilt into the
-    # default (128,256) head fails to load with a shape error. Absent on
-    # pre-ablation checkpoints, where None restores the (128,256) default.
+    # U-Net widths the checkpoint was trained with (None: the default).
     unet_dims = ckpt.get('config', {}).get('unet_dims', None)
     cola = COLAModel(use_proprio=use_proprio, split_gripper=split_gripper,
-                     use_overhead=use_overhead, use_diffusion=use_diffusion,
+                     use_overhead=use_overhead, use_wrist=use_wrist,
+                     use_diffusion=use_diffusion,
                      diffusion_unet=diffusion_unet, unet_dims=unet_dims)
     if diffusion_unet:
         print(f"   unet down_dims: {tuple(unet_dims) if unet_dims else '(128, 256) [default]'}")
     cola.params = ckpt['params']
     print(f"   loaded (epoch {ckpt.get('epoch', '?')}, "
           f"val_loss {ckpt.get('val_loss', float('nan')):.6f})")
-    print(f"   overhead cam: {'on' if use_overhead else 'off'}")
+    print(f"   cameras: {'+'.join(c for c, on in (('wrist', use_wrist), ('overhead', use_overhead)) if on)}")
     print(f"   proprioception: {'on' if use_proprio else 'off'} | "
           f"gripper: {'logit' if split_gripper else 'tanh'}")
 
-    # A checkpoint trained with the channel severed is meaningless to evaluate
-    # with messages on. Older checkpoints predate the flag, so default to True.
+    # A checkpoint trained without messages must be evaluated without them.
+    # Older checkpoints predate the flag, so default to True.
     trained_with_messages = bool(ckpt.get('use_messages', True))
     if use_messages and not trained_with_messages:
         raise SystemExit(
@@ -419,7 +360,7 @@ def evaluate_cola(
     if use_proprio and normalise_state is None:
         raise SystemExit(
             f'Checkpoint expects proprioception but {cache_dir}/state_stats.json '
-            f'is missing. Run prepare_states_h5.py.'
+            f'is missing. Run prepare_states_2arm.py.'
         )
 
     print('\n2. Building ALOHA scene...')
@@ -451,15 +392,19 @@ def evaluate_cola(
         'transfer_count': 0,
         'drop_count': 0,
         'a_lifted_count': 0,
+        'a_touched_count': 0,
         'b_touched_count': 0,
+        # Episodes whose start-state grasp failed; they are not scored.
+        'skipped': 0,
+        'seed_offset': int(seed_offset),
     }
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep_idx in tqdm(range(n_episodes), desc='Evaluating'):
         if handover_only:
-            # A start state the grasp did not survive is not a policy failure;
-            # skip rather than score an episode that began with an empty hand.
+            # Skip episodes whose start-state grasp failed.
             if not reset_episode_handover(scene, seed_offset + ep_idx, scene_xml):
+                results['skipped'] += 1
                 print(f'  ep {ep_idx}: skipped (grasp lost building start state)')
                 continue
         else:
@@ -467,9 +412,10 @@ def evaluate_cola(
 
         frames = []
         a_lifted = False        # A picked the box up off the table
+        a_touched = False       # A's fingers reached the box at all
         b_touched = False       # B made contact with the box at all
         handover_run = 0        # consecutive steps the transfer condition holds
-        transfer_done = False   # phase 1 complete (the legacy success criterion)
+        transfer_done = False   # phase 1 complete
         transfer_step = None    # control step at which phase 1 completed
         settle_run = 0          # steps B has kept the box since the transfer
         no_contact_run = 0      # consecutive steps B is not touching the box
@@ -482,17 +428,16 @@ def evaluate_cola(
         max_box_z = 0.0
         max_handover_run = 0
         best_home_err = float('inf')   # smallest post-transfer home error seen
+        min_a_box_dist = float('inf')  # closest approach of A's gripper to the box
 
         while control_step < max_control_steps and not success and not dropped:
-            # Each arm sees only its own wrist camera — the partial
-            # observability the message channel is meant to bridge.
+            # Each arm sees only its own wrist camera.
             renderer.update_scene(data, camera='wrist_cam_left')
             image_a = renderer.render()[np.newaxis, ...]
             renderer.update_scene(data, camera='wrist_cam_right')
             image_b = renderer.render()[np.newaxis, ...]
 
-            # One fixed third-person view, shared by both arms -- the same
-            # image_overhead stream the features were extracted from.
+            # Shared overhead view, as in the extracted features.
             image_o = None
             if use_overhead:
                 renderer.update_scene(data, camera='overhead_cam')
@@ -512,10 +457,7 @@ def evaluate_cola(
             chunk_b = np.array(chunk_b[0])
 
             if split_gripper:
-                # Column 6 is a logit, not a normalised position: threshold it
-                # and command the actuator's open/closed endpoints. Running it
-                # through denormalise() would map a logit of, say, 3.0 far
-                # outside the ctrl range.
+                # Column 6 is a logit: threshold it to the gripper's open/closed targets.
                 grip_a = np.where(chunk_a[:, 6] > 0.0, GRIPPER_OPEN, GRIPPER_CLOSED)
                 grip_b = np.where(chunk_b[:, 6] > 0.0, GRIPPER_OPEN, GRIPPER_CLOSED)
                 chunk_a = denormalise(chunk_a, 'action_a')
@@ -526,18 +468,15 @@ def evaluate_cola(
                 chunk_a = denormalise(chunk_a, 'action_a')
                 chunk_b = denormalise(chunk_b, 'action_b')
 
-            for k in range(CHUNK_SIZE):
+            # Execute only what was predicted; a shorter head means re-querying sooner.
+            n_exec = min(len(chunk_a), len(chunk_b), CHUNK_SIZE)
+            for k in range(n_exec):
                 if control_step >= max_control_steps:
                     break
 
                 if velocity_actions:
-                    # A velocity cache stores per-step joint DELTAS. Written
-                    # straight to ctrl they would command "go to 0.03 rad from
-                    # the origin" instead of "move 0.03 from here", so integrate
-                    # onto the arm's CURRENT pose. Read qpos fresh each step:
-                    # accumulating onto the previous command instead would let
-                    # the target drift away from where the arm actually is
-                    # whenever the position servo lags.
+                    # Velocity actions are deltas: add them to the current
+                    # joint positions, read fresh each step.
                     step_a = chunk_a[k].copy()
                     step_b = chunk_b[k].copy()
                     step_a[:6] = data.qpos[scene['a']['qadr']] + step_a[:6]
@@ -555,13 +494,18 @@ def evaluate_cola(
 
                 control_step += 1
 
-                box_z = float(data.qpos[scene['box_qposadr'] + 2])
+                box_pos = data.qpos[scene['box_qposadr']:scene['box_qposadr'] + 3]
+                box_z = float(box_pos[2])
                 a_holds = touching_box(data, scene['box_geom'], scene['a']['finger_geoms'])
                 b_holds = touching_box(data, scene['box_geom'], scene['b']['finger_geoms'])
 
                 a_lifted |= a_holds and box_z > LIFT_Z
+                a_touched |= a_holds
                 b_touched |= b_holds
                 max_box_z = max(max_box_z, box_z)
+                min_a_box_dist = min(
+                    min_a_box_dist,
+                    float(np.linalg.norm(data.site(scene['a']['site']).xpos - box_pos)))
 
                 # A has genuinely let go, not merely lost contact for a frame.
                 a_open = (float(data.qpos[scene['a']['finger_qadr']])
@@ -569,7 +513,7 @@ def evaluate_cola(
                 b_has_box = b_holds and box_z > LIFT_Z
 
                 if not transfer_done:
-                    # ---- Phase 1: transfer -------------------------------
+                    # Phase 1: transfer
                     if b_has_box and not a_holds and a_open:
                         handover_run += 1
                     else:
@@ -582,9 +526,8 @@ def evaluate_cola(
                         if criterion == 'transfer':
                             success = True
                 else:
-                    # ---- Phase 2: keep it (and optionally go home) --------
-                    # Drop test keys on CONTACT, not height: B may carry the box
-                    # low on the way back, and box_z < LIFT_Z there is not a drop.
+                    # Phase 2: keep it (and optionally go home). The drop test
+                    # keys on contact: B may carry the box low on the way back.
                     no_contact_run = 0 if b_holds else no_contact_run + 1
                     if no_contact_run >= DROP_STEPS:
                         dropped = True
@@ -620,9 +563,12 @@ def evaluate_cola(
                 label = 'FAIL_BTOUCH_NOXFER'
             elif a_lifted:
                 label = 'FAIL_NOHANDOVER'
+            elif a_touched:
+                label = 'FAIL_TOUCHED_NOLIFT'
             else:
                 label = 'FAIL_NOLIFT'
-            imageio.mimsave(str(videos_dir / f'episode_{ep_idx:03d}_{label}.mp4'), frames, fps=20)
+            imageio.mimsave(str(videos_dir / f'episode_{ep_idx:03d}_{label}.mp4'),
+                            frames, fps=20)
 
         results['episodes'].append({
             'episode': ep_idx,
@@ -633,9 +579,12 @@ def evaluate_cola(
             'dropped': bool(dropped),
             'settle_run': settle_run,
             'a_lifted': bool(a_lifted),
+            'a_touched': bool(a_touched),
             'b_touched': bool(b_touched),
             'final_box_z': float(data.qpos[scene['box_qposadr'] + 2]),
             'max_box_z': max_box_z,
+            'min_a_box_dist': (None if min_a_box_dist == float('inf')
+                               else min_a_box_dist),
             'max_handover_run': max_handover_run,
             'best_home_err': None if best_home_err == float('inf') else best_home_err,
         })
@@ -643,23 +592,36 @@ def evaluate_cola(
         results['transfer_count'] += int(transfer_done)
         results['drop_count'] += int(dropped)
         results['a_lifted_count'] += int(a_lifted)
+        results['a_touched_count'] += int(a_touched)
         results['b_touched_count'] += int(b_touched)
 
     renderer.close()
 
+    scored = len(results['episodes'])
+    denom = max(scored, 1)
     transferred = [e for e in results['episodes'] if e['transfer_step'] is not None]
+    dists = [e['min_a_box_dist'] for e in results['episodes']
+             if e['min_a_box_dist'] is not None]
+
     results['summary'] = {
         'n_episodes': n_episodes,
-        'success_rate': 100.0 * results['task_successes'] / n_episodes,
-        # Phase 1 only == the criterion used before the return phase existed.
-        'transfer_rate': 100.0 * results['transfer_count'] / n_episodes,
-        'drop_rate': 100.0 * results['drop_count'] / n_episodes,
+        # Episodes played: those whose start-state grasp failed are not scored.
+        'n_scored': scored,
+        'success_rate': 100.0 * results['task_successes'] / denom,
+        # Phase 1 only.
+        'transfer_rate': 100.0 * results['transfer_count'] / denom,
+        'drop_rate': 100.0 * results['drop_count'] / denom,
         # Of the episodes that transferred, how many then lost the box.
         'drop_given_transfer': (100.0 * results['drop_count'] / len(transferred)
                                 if transferred else None),
-        'a_lift_rate': 100.0 * results['a_lifted_count'] / n_episodes,
-        'b_touch_rate': 100.0 * results['b_touched_count'] / n_episodes,
-        'mean_control_steps': float(np.mean([e['control_steps'] for e in results['episodes']])),
+        # Pick-up (the zero-shot Octo headline).
+        'a_lift_rate': 100.0 * results['a_lifted_count'] / denom,
+        'a_touch_rate': 100.0 * results['a_touched_count'] / denom,
+        'b_touch_rate': 100.0 * results['b_touched_count'] / denom,
+        'min_a_box_dist_median': float(np.median(dists)) if dists else None,
+        'min_a_box_dist_best': float(np.min(dists)) if dists else None,
+        'mean_control_steps': float(np.mean([e['control_steps']
+                                             for e in results['episodes']])) if scored else None,
         'mean_transfer_step': (float(np.mean([e['transfer_step'] for e in transferred]))
                                if transferred else None),
     }
@@ -668,19 +630,21 @@ def evaluate_cola(
     print('RESULTS')
     print('=' * 60)
     s = results['summary']
-    print(f"Success:           {results['task_successes']}/{n_episodes} = "
+    print(f"Success:           {results['task_successes']}/{s['n_scored']} = "
           f"{s['success_rate']:.1f}%   ({crit_desc})")
+    if results['skipped']:
+        print(f"  Skipped (grasp lost at reset): {results['skipped']}")
     print(f"  Transfer only:   {s['transfer_rate']:.1f}%   (legacy criterion)")
     print(f"  Dropped after:   {s['drop_rate']:.1f}%"
           + (f"   ({s['drop_given_transfer']:.1f}% of transfers)"
              if s['drop_given_transfer'] is not None else ''))
     print(f"  A lifted the box:  {s['a_lift_rate']:.1f}%   (partial credit)")
     print(f"  B touched the box: {s['b_touch_rate']:.1f}%   (partial credit)")
-    print(f"Mean control steps: {s['mean_control_steps']:.1f}")
+    if s['mean_control_steps'] is not None:
+        print(f"Mean control steps: {s['mean_control_steps']:.1f}")
     if s['mean_transfer_step'] is not None:
-        # If this sits near max_control_steps there is no room left for phase 2
-        # — raise --max-control-steps rather than reading the success rate as a
-        # policy failure.
+        # If this approaches max_control_steps, raise --max-control-steps before
+        # reading failures as policy failures.
         print(f"Mean transfer step: {s['mean_transfer_step']:.1f} / {max_control_steps}")
 
     out_path = Path(results_path)
@@ -697,7 +661,7 @@ def evaluate_cola(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=str,
-                        default='experiments/run_aloha_handover_01/checkpoints/best_model.pkl')
+                        default=str(REPO / 'runs' / 'handover_2arm' / 'checkpoints' / 'best_model.pkl'))
     parser.add_argument('--episodes', type=int, default=50)
     parser.add_argument('--scene-xml', type=str, default=SCENE_XML)
     parser.add_argument('--cache-dir', type=str, default=CACHE_DIR)
@@ -712,14 +676,11 @@ if __name__ == '__main__':
                         help='start each episode with arm A already holding the box, '
                              'as the handover-only demos do, instead of spawning it '
                              'on the table. Required for checkpoints trained on '
-                             'aloha-handover-only-*: evaluating one of those against '
+                             'handover-only demos: evaluating one of those against '
                              'a table spawn measures distribution mismatch, not skill.')
-    parser.add_argument('--video-dir', type=str,
-                        default='experiments/run_aloha_handover_01/evaluation_videos')
-    parser.add_argument('--results-path', type=str,
-                        default='experiments/run_aloha_handover_01/logs/cola_eval_aloha_results.json')
-    # Raised from 200: the episode no longer stops at the transfer, so phase 2
-    # needs room. Watch mean_transfer_step to size this.
+    parser.add_argument('--video-dir', type=str, default=str(RESULTS_DIR / 'videos'))
+    parser.add_argument('--results-path', type=str, default=str(RESULTS_DIR / 'results.json'))
+    # Leaves room for phase 2 after the transfer (see mean_transfer_step).
     parser.add_argument('--max-control-steps', type=int, default=350)
     parser.add_argument('--no-messages', action='store_true',
                         help='zero the message channel (L0 no-coordination baseline)')

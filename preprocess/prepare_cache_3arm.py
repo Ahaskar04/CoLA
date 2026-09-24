@@ -1,31 +1,15 @@
-"""
-Build the 3-arm training cache: normalised actions, z-scored states, splits.
+"""Build the three-arm training cache: normalised actions, states and splits.
 
-Port of prepare_h5_handover.py + prepare_states_h5.py (the 2-arm pair), merged
-into one script because there was no reason to walk the same 185 episodes twice.
-
-Writes, for each of train/val/test:
-
-    {split}_actions_{a,b,c}.npy   (N, 7) float32, min/max mapped to [-0.9, 0.9]
-    {split}_states_{a,b,c}.npy    (N, 7) float32, z-scored
-    {split}_episode_lens.npy      (n_episodes,) int64
-    action_stats.json             per-arm min/max, for denormalising at rollout
+Writes to cache_dir:
+    {split}_actions_{a,b,c}.npy   (N, 7), min/max mapped to [-0.9, 0.9]
+    {split}_states_{a,b,c}.npy    (N, 7), z-scored
+    {split}_episode_lens.npy      (n_episodes,)
+    action_stats.json             per-arm min/max, for denormalising
     state_stats.json              per-arm mean/std
-    split_manifest.json           episode paths in the order rows were written
+    split_manifest.json           episode paths in row order
 
-Row i of every array refers to the same timestep of the same episode. That
-alignment is the whole contract: extract_features_3arm.py reads the manifest and
-must produce features in exactly this order.
-
-Why z-score states but min/max the actions: the action normaliser exists to fit
-a tanh output range. States are an input, so what matters is only that each
-dimension arrives at a comparable scale.
-
-NOTE ON FAILED EPISODES. The 2-arm script kept them and stratified the split by
-the `success` attr. The 3-arm dataset at aloha-handover-3arm-v1 has already had
-its 115 failures deleted, so every episode there is a success and the
-stratification is a no-op. It is kept anyway: it costs nothing, and it keeps
-this script correct against an un-filtered directory.
+Statistics are fitted on the train split. The split is 80/10/10, stratified
+by episode success.
 """
 
 import argparse
@@ -36,8 +20,9 @@ import h5py
 import numpy as np
 
 
-DATA_DIR = Path('/scratch/users/ntu/ahaskar0/aloha-handover-3arm-v1')
-CACHE_DIR = Path('/scratch/users/ntu/ahaskar0/v1/cola-3arm-scratchdata/cache_aloha_handover_3arm')
+REPO = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO / 'data' / 'demos' / 'handover_3arm'
+CACHE_DIR = REPO / 'data' / 'cache' / 'handover_3arm'
 
 ARMS = ('a', 'b', 'c')
 
@@ -47,9 +32,7 @@ VAL_FRAC = 0.10
 
 SEED = 42
 
-# Raw actions are mapped onto [-MARGIN, MARGIN] rather than [-1, 1]: tanh only
-# reaches +/-1 asymptotically, so leaving headroom keeps the extreme timesteps
-# reachable instead of demanding infinite pre-activations.
+# Actions map to [-MARGIN, MARGIN], leaving headroom inside tanh's range.
 MARGIN = 0.9
 # Column 6 of an action is the gripper; 0..5 are joints.
 GRIPPER_COL = 6
@@ -65,8 +48,7 @@ def scan_episodes(data_dir: Path):
     for p in paths:
         try:
             with h5py.File(p, 'r') as f:
-                # Assert the three-arm schema up front rather than failing
-                # halfway through a 40 GB read.
+                # Check the three-arm schema before the long read.
                 for arm in ARMS:
                     for key in (f'action_{arm}', f'state_{arm}'):
                         if key not in f:
@@ -125,15 +107,9 @@ def load_arrays(paths, kind):
 
 
 def to_velocity(actions, lens):
-    """Absolute joint targets -> per-step deltas, respecting episode boundaries.
+    """Absolute joint targets -> per-step deltas, within each episode.
 
-    The gripper column is left ABSOLUTE. It is binary and handled by a BCE head;
-    differencing it would produce three values (-1/0/+1 open, hold, close) and
-    break that head's assumption.
-
-    Differencing must not cross episode boundaries -- the last action of one
-    episode and the first of the next are unrelated poses, and a delta between
-    them is a fictional jump. The first step of each episode gets a zero delta.
+    The binary gripper column stays absolute; each episode's first delta is 0.
     """
     out = np.zeros_like(actions)
     start = 0
@@ -153,7 +129,7 @@ def fit_normaliser(actions):
     lo = actions.min(axis=0)
     hi = actions.max(axis=0)
     span = hi - lo
-    # A constant column would divide by zero; map it to 0 instead.
+    # Avoid dividing by zero on constant columns.
     span = np.where(span < 1e-8, 1.0, span)
     return lo.astype(np.float32), hi.astype(np.float32), span.astype(np.float32)
 
@@ -191,9 +167,7 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
-    # Optional cap on how many episodes to use at all. Subsample BEFORE the
-    # split so train/val/test stay 80/10/10 of the capped set, and do it
-    # stratified so the success ratio is preserved.
+    # Optional episode cap, applied before the split and stratified by success.
     if args.max_episodes and args.max_episodes < len(episodes):
         keep_idx = []
         for mask in (successes, ~successes):
@@ -215,13 +189,11 @@ def main():
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- actions: fit the normaliser on train only, apply to all splits ----
+    # Actions: fit the normaliser on train only, apply to all splits
     print('\nLoading train actions to fit the normaliser...')
     train_act, train_lens = load_arrays(train, 'action')
     if args.velocity:
-        # Fit on deltas, not absolute targets: their ranges differ by an order
-        # of magnitude, so reusing position stats would squash every delta to
-        # near zero after normalisation.
+        # Fit the normaliser on deltas (their range differs from positions).
         train_act = {a: to_velocity(train_act[a], train_lens) for a in ARMS}
     norm = {a: fit_normaliser(train_act[a]) for a in ARMS}
 
@@ -231,8 +203,7 @@ def main():
 
     stats = {
         'margin': MARGIN,
-        # Rollout must know: velocity actions are integrated onto the current
-        # pose, position actions are written straight to ctrl.
+        # Tells the rollout whether to integrate actions or apply them directly.
         'velocity': bool(args.velocity),
         'source': 'train split of ' + str(args.data_dir),
         'note': 'raw = (norm + margin) / (2*margin) * (max - min) + min',
@@ -242,7 +213,7 @@ def main():
     with open(args.cache_dir / 'action_stats.json', 'w') as f:
         json.dump(stats, f, indent=2)
 
-    # ---- states: z-score, fitted on train only ----
+    # States: z-score, fitted on train only
     print('\nLoading train states to fit the z-scoring...')
     train_state, state_lens = load_arrays(train, 'state')
     assert np.array_equal(train_lens, state_lens), \

@@ -1,43 +1,28 @@
-"""
-Pre-extract Octo-Base features for the ALOHA handover HDF5 dataset.
+"""Extract frozen Octo-Base features for the two-arm datasets.
 
-Reads split_manifest.json written by prepare_h5_handover.py, streams the
-wrist camera images out of each .h5 in manifest order, runs the frozen Octo
-backbone once over every timestep and saves the 768-dim vectors:
+Reads split_manifest.json from prepare_cache_2arm.py and writes, per split:
+    {split}_features_{a,b}.npy   (N, 768)   each arm's wrist camera
+    {split}_features_o.npy       (N, 768)   overhead camera, with --overhead
 
-    {split}_features_a.npy  (N, 768) float32
-    {split}_features_b.npy  (N, 768) float32
-    {split}_features_o.npy  (N, 768) float32   (overhead, when --overhead)
-
-Row i here lines up with row i of {split}_actions_{a,b}.npy, so the manifest
-order must not change between the two scripts.
-
-Agent A sees image_wrist_a and agent B sees image_wrist_b, matching the
-per-agent partial observability the COLA message channel is meant to bridge.
-
---overhead additionally extracts image_overhead into {split}_features_o.npy,
-which the model concatenates onto BOTH arms' self-representation. Note this
-deliberately weakens the partial-observability setup the message channel exists
-to bridge: with a shared global view there is less for the arms to tell each
-other. It is here because the wrist cameras move with the arm, so once the
-policy drifts off the expert trajectory they show frames present in no
-demonstration, whereas a fixed camera keeps reporting where the box is. Treat
-it as an ablation arm, not the default configuration.
+Rows follow the manifest, so they line up with {split}_actions_*.npy.
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 from tqdm import tqdm
 
-from cola_architecture import COLAModel, FEATURE_DIM
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from cola.model import COLAModel, FEATURE_DIM  # noqa: E402
 
 
-CACHE_DIR = Path('/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/cache_aloha_handover')
-FEAT_DIR = Path('/scratch/users/ntu/ahaskar0/v1/cola-research-scratchdata/features_aloha_handover')
+CACHE_DIR = REPO / 'data' / 'cache' / 'handover_2arm'
+FEAT_DIR = REPO / 'data' / 'features' / 'handover_2arm'
 BATCH_SIZE = 64
 
 
@@ -78,7 +63,7 @@ def main():
 
     manifest_path = args.cache_dir / 'split_manifest.json'
     if not manifest_path.exists():
-        raise SystemExit(f'Missing {manifest_path}. Run prepare_h5_handover.py first.')
+        raise SystemExit(f'Missing {manifest_path}. Run prepare_cache_2arm.py first.')
     with open(manifest_path) as f:
         manifest = json.load(f)
 
@@ -104,11 +89,10 @@ def main():
         feats_b = np.concatenate(feats_b)
         feats_o = np.concatenate(feats_o) if args.overhead else None
 
-        # The actions were written from the same manifest order, so any length
-        # disagreement means the two scripts saw different data.
+        # Features and actions come from the same manifest, so lengths must match.
         n_actions = len(np.load(args.cache_dir / f'{split}_actions_a.npy', mmap_mode='r'))
         assert len(feats_a) == n_actions, \
-            f'{split}: {len(feats_a)} features vs {n_actions} actions — re-run prepare_h5_handover.py'
+            f'{split}: {len(feats_a)} features vs {n_actions} actions — re-run prepare_cache_2arm.py'
 
         np.save(args.feat_dir / f'{split}_features_a.npy', feats_a)
         np.save(args.feat_dir / f'{split}_features_b.npy', feats_b)

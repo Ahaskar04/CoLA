@@ -1,3 +1,5 @@
+"""Scripted expert for the three-arm handover (A -> B -> C), driven by mink IK."""
+
 from pathlib import Path
 import mujoco
 import mujoco.viewer
@@ -10,7 +12,7 @@ from utils import setup_dual_arm_ik, compensate_gravity, check_gripper_box_conta
 
 _HERE = Path(__file__).parent
 _PROJECT_ROOT = _HERE.parent.parent
-_XML = _PROJECT_ROOT / "environments" / "handover_3arm" / "scene.xml"
+_XML = _PROJECT_ROOT / "envs" / "handover_3arm" / "scene.xml"
 
 setup = setup_dual_arm_ik(_XML)
 
@@ -85,14 +87,7 @@ class EpisodeData:
 
 
 class ExpertState:
-    """The scripted expert's carried state.
-
-    The expert is a phase machine, so it cannot be queried from a bare
-    (model, data) snapshot: `phase` says which stage it believes it is in, and
-    `target_pos` / `target_pos_b` are IK goals that each phase MUTATES rather
-    than recomputing from scratch. `configuration` is mink's own copy of the
-    joint state. All of it has to be carried between steps.
-    """
+    """The expert's state carried between steps (phase, IK targets, mink configuration)."""
 
     __slots__ = ('phase', 'target_pos', 'target_pos_b', 'target_pos_c', 'gripper_ctrl',
                  'right_gripper_ctrl', 'third_gripper_ctrl',
@@ -116,8 +111,7 @@ class ExpertState:
         self.left_neutral_quat = left_neutral_quat
         self.right_neutral_pos = right_neutral_pos
         self.right_neutral_quat = right_neutral_quat
-        # Arm C. Default None so 2-arm callers construct an ExpertState
-        # unchanged; the B->C phases fill these in.
+        # Arm C targets (filled in by the B->C phases).
         self.target_pos_c = target_pos_c
         self.third_gripper_ctrl = third_gripper_ctrl
         self.third_neutral_pos = third_neutral_pos
@@ -131,65 +125,33 @@ class ExpertState:
         return _copy.deepcopy(self)
 
 
-# Constants the phase machine uses. Module level so expert_step() and
-# run_episode() cannot drift apart.
+# Constants shared by expert_step() and run_episode().
 DT = 1.0 / 200.0
 APPROACH_HEIGHT_OFFSET = 0.10
 POS_THRESHOLD = 0.02
 B_APPROACH_HEIGHT_OFFSET = 0.08
-# How close B's gripper site ends up to A's. 0.03 was tuned for B reaching
-# DOWN onto a box lying flat; coming in horizontally at a box held out
-# sideways it left B short, closing just outside the box. 0.01 brings it
-# deeper still: at +0.01 two of five episodes sat in grip_b for 140+ steps
-# closing on air, so B's target now sits 1cm PAST A's gripper site and the
-# fingers straddle the box. The box is 8cm long, so there is room.
-# 1cm deeper than the 0.03 the dataset was collected at. Earlier depth tests
-# (0.01 -> 2/5, -0.01 -> 0/5, B pushing the box away) predate the
-# B_GRIP_THRESHOLD fix, when B closed 4.5cm short no matter where its
-# target sat -- so they are confounded and worth redoing.
+# Offset of B's grasp target from A's gripper site.
 RIGHT_TARGET_OFFSET = np.array([0.02, 0.0, 0.0])
-# approach_b -> grip_b used POS_THRESHOLD (0.02), so B started closing while
-# still 2cm short of its own target -- which is itself 3cm from A's gripper.
-# Tracing grip_b showed B shutting its fingers 4.5cm from the box with ZERO
-# right/* contacts: it closed on air, then A released into nothing and the
-# box fell. Require B to actually arrive before it grips.
+# B must reach its target this closely before closing its gripper.
 B_GRIP_THRESHOLD = 0.005
 A_GRASP_OFFSET = np.array([-0.02, 0.0, 0.0])
-# Where arm A holds the box out for the handover, on the axis between the
-# two arms (A base x=-0.55, B base x=+0.55, midline x=0). Handover-only
-# episodes start with A at neutral, so without a phase that moves it the
-# whole transfer is done by B travelling across the table.
+# x at which arm A presents the box, near the midline between A and B.
 PRESENT_X = -0.02
-# Where arm B holds the box out for the SECOND handover. Arm bases sit at
-# -0.55 / +0.55 / +1.65, so B is exactly midway between A and C and the two
-# 1.10 m gaps are identical: the B->C meet point is the A->B one mirrored
-# about B, i.e. PRESENT_X reflected through x=+0.55.
+# x at which B presents the box to C: PRESENT_X mirrored about B's base.
 PRESENT_X_C = 2 * 0.55 - PRESENT_X          # +1.12
-# B must turn to face C before presenting. Verified in simulation: the box
-# survives a full 180 deg waist sweep with contact held at every 15 deg step.
+# B turns 180 degrees to face C before presenting.
 B_TURN_RAD = np.pi
-# Camera the human-review video is rendered from. COLA_REVIEW_CAMERA=wrist_cam_left
-# shows arm A's own point of view -- what the policy actually sees.
-# For 3-arm: side_cam shows all three arms
+# Camera for the review video (side_cam shows all three arms).
 REVIEW_CAMERA = os.environ.get("COLA_REVIEW_CAMERA", "side_cam")
 
 
 def expert_step(setup, est, sync_configuration=False):
-    """One step of the scripted expert: decide, solve IK, advance the phase.
+    """One expert step: choose targets, solve IK, advance the phase.
 
-    Returns (action_a, action_b, est) where each action is
-    [6 joint targets, gripper] -- exactly the layout collect_demos.py records.
-
-    Does NOT write data.ctrl and does NOT step physics, so it can run alongside
-    a learned policy that owns the arms (DAgger observer mode).
-
-    sync_configuration=True re-seeds mink from data.qpos before solving. Needed
-    whenever something OTHER than this function moved the arms -- otherwise the
-    expert computes a correction from a pose the arm is not actually in.
-
-    NOTE: this writes data.mocap_pos/quat, because mink reads the IK target back
-    out of the mocap bodies. The marker geoms are alpha 0, so this does not
-    change what any camera sees.
+    Returns (action_a, action_b, est), each action [6 joint targets, gripper].
+    Doesn't write data.ctrl or step physics. sync_configuration=True re-seeds
+    mink from data.qpos (needed if something else moved the arms). Writes the
+    mocap targets that mink reads.
     """
     model = setup["model"]
     data = setup["data"]
@@ -211,23 +173,21 @@ def expert_step(setup, est, sync_configuration=False):
     GRASP_ORIENTATION = setup["GRASP_ORIENTATION"]
     LIFT_HEIGHT = setup["LIFT_HEIGHT"]
 
-    # During turn_b, don't reset configuration from data.qpos - we're manually controlling the waist
+    # During turn_b the waist is driven directly, not re-synced from data.qpos.
     phase = est.phase
     if sync_configuration and phase != "turn_b":
         configuration.update(data.qpos)
 
-    # Override waist angle during turn_b phase - do this AFTER configuration.update()
-    # but BEFORE IK solve, so we manually control the waist and keep other joints frozen
+    # turn_b: set the waist angle after configuration.update() and before the IK solve.
     if phase == "turn_b":
         global _turn_b_step_count, _turn_b_initialized
         if est.waist_b_target_angle is not None:
-            # Use DOF ID not qposadr! right_dof_ids[0] is the waist (first in the joint list)
+            # DOF id, not qposadr (right_dof_ids[0] is the waist).
             waist_dof_id = right_dof_ids[0]
             waist_qpos_id = model.joint('right/waist').qposadr[0]
             current_angle = data.qpos[waist_qpos_id]
 
-            # Track the commanded angle in configuration.data.qpos, incrementing it each step
-            # NOTE: configuration.q is a property that returns a COPY, so we must modify data.qpos directly!
+            # Track the commanded angle in configuration.data.qpos (configuration.q is a copy).
             if not _turn_b_initialized:
                 _turn_b_initialized = True
                 _turn_b_step_count = 0
@@ -243,10 +203,10 @@ def expert_step(setup, est, sync_configuration=False):
             commanded_angle = configuration.data.qpos[waist_qpos_id]
             angle_remaining = est.waist_b_target_angle - commanded_angle
 
-            # Rotate in small increments (0.05 rad per step = ~2.86 degrees)
+            # 0.05 rad (~2.9 deg) per step.
             WAIST_ROTATION_SPEED = 0.05
             if abs(angle_remaining) > WAIST_ROTATION_SPEED:
-                # Still rotating - increment the commanded angle directly in data.qpos
+                # Still rotating: advance the commanded angle.
                 old_val = configuration.data.qpos[waist_qpos_id]
                 configuration.data.qpos[waist_qpos_id] += np.sign(angle_remaining) * WAIST_ROTATION_SPEED
                 new_val = configuration.data.qpos[waist_qpos_id]
@@ -278,15 +238,11 @@ def expert_step(setup, est, sync_configuration=False):
         est.target_pos = np.array([box_pos[0] + A_GRASP_OFFSET[0], box_pos[1], LIFT_HEIGHT])
 
     elif phase == "present_a":
-        # Only x is overridden: y and z keep whatever the reset randomised,
-        # so the presentation pose still varies episode to episode.
+        # Override x only; y and z keep the randomised presentation offset.
         est.target_pos = np.array([PRESENT_X, est.target_pos[1], est.target_pos[2]])
 
     elif phase == "move_arm_B":
-        # Stage OUTWARD along x (B's own side), not above. The old
-        # [0, 0, B_APPROACH_HEIGHT_OFFSET] put B 8cm over the box so approach_b
-        # then dropped onto it -- correct for a box lying on the table, wrong
-        # for one held out horizontally, where B should come in from the side.
+        # Stage B outward along x, so it approaches the held box from the side.
         est.target_pos_b = est.target_pos + RIGHT_TARGET_OFFSET + np.array([B_APPROACH_HEIGHT_OFFSET, 0.0, 0.0])
         data.mocap_pos[right_mocap_id] = est.target_pos_b
         right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
@@ -308,12 +264,10 @@ def expert_step(setup, est, sync_configuration=False):
         data.mocap_quat[right_mocap_id] = est.right_neutral_quat
         right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
 
-    # ---- second leg: B hands on to C ----
+    # Second leg: B hands on to C
     elif phase == "turn_b":
-        # Rotate B to face C. The waist is driven directly rather than through
-        # IK: asking the solver for a pose on the far side of a 180 deg sweep
-        # invites it to take an arbitrary path, and the box is held by friction
-        # alone. Everything else is left where it is so the grasp is undisturbed.
+        # Rotate B to face C by driving the waist directly (IK could take an
+        # arbitrary path); the grasp is left undisturbed.
 
         # Initialize rotation on first entry to this phase
         if est.waist_b_start_angle is None:
@@ -321,24 +275,19 @@ def expert_step(setup, est, sync_configuration=False):
             est.waist_b_start_angle = data.qpos[waist_joint_id]
             est.waist_b_target_angle = est.waist_b_start_angle + B_TURN_RAD
 
-        # Keep the IK target tracking the current gripper position
-        # so other joints don't try to move to compensate for waist rotation
+        # Keep the IK target on the current gripper so other joints don't compensate.
         mink.move_mocap_to_frame(model, data, "right/target", "right/gripper", "site")
         est.target_pos_b = data.mocap_pos[right_mocap_id].copy()
         right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
 
     elif phase == "present_b2":
-        # Mirror of present_a: only x is overridden, so whatever y/z the box
-        # ended up at after the first handover carries through and the
-        # presentation to C still varies episode to episode.
+        # Mirror of present_a: override x only.
         est.target_pos_b = np.array([PRESENT_X_C, est.target_pos_b[1], est.target_pos_b[2]])
         data.mocap_pos[right_mocap_id] = est.target_pos_b
         right_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "right/target"))
 
     elif phase == "move_arm_C":
-        # C stages OUTWARD along +x on its own side, mirroring move_arm_B.
-        # After B rotated 180°, the box orientation flipped, so C approaches from +x
-        # (same direction as B did) to reach the opposite side of the box.
+        # C stages outward along +x on its own side and approaches the box from +x.
         est.target_pos_c = (est.target_pos_b + RIGHT_TARGET_OFFSET
                             + np.array([B_APPROACH_HEIGHT_OFFSET, 0.0, 0.0]))
         data.mocap_pos[third_mocap_id] = est.target_pos_c
@@ -361,11 +310,10 @@ def expert_step(setup, est, sync_configuration=False):
         _approach_c_step_count += 1
         # Set target position and shift mocap directly to avoid gripper collision
         base_target = est.target_pos_b + RIGHT_TARGET_OFFSET
-        # Shift the mocap position in X to avoid collision with arm B's gripper
-        # Need enough space for both grippers to fit without jamming
+        # Offset C's target in x so the two grippers don't jam.
         mocap_pos = base_target.copy()
-        mocap_pos[0] += 0.015  # 15mm X offset (arm C is to the right along X-axis)
-        est.target_pos_c = mocap_pos  # Store the actual target position for distance calculations
+        mocap_pos[0] += 0.015  # 15 mm toward C
+        est.target_pos_c = mocap_pos  # used for distance checks
         data.mocap_pos[third_mocap_id] = mocap_pos
         third_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "third/target"))
         # Debug: print distance to target every 50 steps
@@ -394,7 +342,7 @@ def expert_step(setup, est, sync_configuration=False):
         data.mocap_quat[left_mocap_id] = target_quat
         left_ee_task.set_target(mink.SE3.from_mocap_name(model, data, "left/target"))
 
-    # Skip IK during turn_b - we manually control the waist and keep other joints frozen
+    # Skip IK during turn_b (the waist is driven directly).
     if phase != "turn_b":
         vel = mink.solve_ik(configuration, tasks, DT, limits=limits, solver=solver, damping=1e-5)
         configuration.integrate_inplace(vel, DT)
@@ -405,8 +353,7 @@ def expert_step(setup, est, sync_configuration=False):
     dist_to_target = np.linalg.norm(current_gripper_pos - est.target_pos)
     right_gripper_pos = data.site('right/gripper').xpos
     dist_right_to_target = np.linalg.norm(right_gripper_pos - est.target_pos_b)
-    # Arm C, and B's own gripper state -- release_b waits on B opening, the way
-    # release_a waits on A. gripper_is_open above tracks arm A only.
+    # Arm C's state, and B's gripper (release_b waits on B opening).
     third_gripper_pos = data.site('third/gripper').xpos
     dist_third_to_target = (np.linalg.norm(third_gripper_pos - est.target_pos_c)
                             if est.target_pos_c is not None else np.inf)
@@ -437,8 +384,7 @@ def expert_step(setup, est, sync_configuration=False):
     elif phase == "release_a" and gripper_is_open:
         est.phase = "retract_b"
     elif phase == "retract_b" and np.linalg.norm(right_gripper_pos - est.right_neutral_pos) < POS_THRESHOLD:
-        # In the 2-arm task this ended the episode. Now B still holds the box
-        # and hands it on to C.
+        # B still holds the box and hands it on to C.
         est.phase = "turn_b"
     elif phase == "turn_b":
         # Check if rotation is complete by comparing to target angle
@@ -457,8 +403,7 @@ def expert_step(setup, est, sync_configuration=False):
     elif phase == "move_arm_C" and dist_third_to_target < POS_THRESHOLD:
         est.phase = "approach_c"
     elif phase == "approach_c" and dist_third_to_target < B_GRIP_THRESHOLD:
-        # Same tight threshold as approach_b: at POS_THRESHOLD (0.02) the
-        # receiving arm starts closing while still short of the box and grips air.
+        # Same tight threshold as approach_b, so C doesn't close on air.
         est.phase = "grip_c"
     elif phase == "grip_c":
         global _grip_c_step_count
@@ -492,23 +437,16 @@ def expert_step(setup, est, sync_configuration=False):
     return action_a, action_b, action_c, est
 
 
-# 2000 sim steps at record_every_n_steps=10 gave exactly 200 recorded frames,
-# which is what both smoke-test episodes hit -- they were not stalling, they
-# ran out of budget mid-rotation. A 2-arm episode takes ~1680 sim steps for
-# ONE handover leg; three arms add a 180 deg turn and a second leg, so 4500
-# leaves headroom without letting a genuinely stuck episode run forever.
+# Three arms add a 180-degree turn and a second handover, hence the larger max_steps.
 def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
                  record_training_data=True, record_every_n_steps=10,
                  record_review_video=True,
                  review_video_every_n_steps=3,
                  handover_only=False):
-    """
-    Run one full pick-and-handover episode, headless (no live viewer).
+    """Run one full pick-and-handover episode headlessly.
 
-    Returns:
-        episode_data: EpisodeData object (or None if record_training_data=False)
-        success: bool, True if the episode reached the "done" phase
-        review_frames: list of rendered frames for a human-review video (or None)
+    Returns (episode_data, success, review_frames); episode_data and
+    review_frames are None when not recorded.
     """
     model = setup["model"]
     data = setup["data"]
@@ -544,51 +482,26 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
     right_target_offset = np.array([0.03, 0.0, 0.0])
 
     if handover_only:
-        # Start mid-task: arm A already holds the box, so the episode is the
-        # handover alone. The keyframe is one settled equilibrium pose; the
-        # randomisation below moves the whole grasp (arm + box together) so
-        # every episode presents the box somewhere different.
+        # Handover-only: start with arm A holding the box, then move the grasp
+        # to a random presentation offset.
         mujoco.mj_resetDataKeyframe(model, data, model.key("handover_start").id)
         mujoco.mj_forward(model, data)
 
         grip0 = data.site('left/gripper').xpos.copy()
         box0 = data.qpos[box_joint_id: box_joint_id + 3].copy()
-        # Capture A's REST pose now, before the mocap is repointed at the IK
-        # goal below. left_neutral_pos is read off the mocap further down, so
-        # without this it would be set to the handover pose and `retract_a`
-        # would have nowhere to retract to.
+        # Record A's rest pose before the mocap is retargeted (retract_a returns to it).
         mink.move_mocap_to_frame(model, data, "left/target", "left/gripper", "site")
         rest_pos_a = data.mocap_pos[left_mocap_id].copy()
         rest_quat_a = data.mocap_quat[left_mocap_id].copy()
-        # x is the axis SEPARATING the two arms (left base at x=-0.55, right at
-        # x=+0.55), so it sets how far apart they meet. Hold it fixed: the arms
-        # should always rendezvous at the same point along that axis, and the
-        # variation should be in where A presents the box within its own
-        # workspace -- left/right (y) and up/down (z).
-        #
-        # y is capped at 0.07, not the 0.10 first tried: at y=+0.108 arm B could
-        # not reach the presentation point at all and the episode sat in
-        # move_arm_B for its full 200 steps. Every episode that completed had
-        # |y| <= 0.065, so beyond ~0.07 the failures are unreachable geometry
-        # rather than hard coordination.
-        #
-        # z is the axis with NO prior variation: every full-task demo lifts to
-        # LIFT_HEIGHT, giving recorded handover height std 0.003, so arm B has
-        # never seen the box presented at a different height.
-        # Capped at 0.06: every failure across the tuning runs was a HIGH
-        # presentation (z 0.33-0.35) where B cannot reach, while every
-        # success was z <= 0.31. At +-0.08 those high draws fail and get
-        # retried with lower ones, so the kept episodes skew low instead of
-        # spanning the range -- less usable height diversity, not more.
+        # Presentation offset: x fixed (the axis between the arms); y and z
+        # randomised.
         offset = np.array([
             0.0,
             np.random.uniform(-0.10, 0.10),
             np.random.uniform(-0.06, 0.06),
         ])
 
-        # Drive A's gripper to the offset pose with IK, carrying the box: the
-        # box is only held by contact, so moving it independently would push it
-        # out of the fingers.
+        # Move A's gripper (and the held box) to the offset pose with IK.
         configuration.update(data.qpos)
         posture_task.set_target_from_configuration(configuration)
         data.mocap_pos[left_mocap_id] = grip0 + offset
@@ -612,8 +525,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
             if np.linalg.norm(data.site('left/gripper').xpos - goal_a) < 0.005:
                 break
 
-        # Reject rather than record a dropped box: an episode that starts with
-        # nothing in the gripper trains the policy on an impossible task.
+        # Reject episodes where the box was dropped during the reset.
         if not check_gripper_box_contact(model, data):
             return None, False, None
 
@@ -668,8 +580,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
     third_neutral_pos = data.mocap_pos[third_mocap_id].copy()
     third_neutral_quat = data.mocap_quat[third_mocap_id].copy()
 
-    # Single source of truth: the phase machine lives in expert_step() so the
-    # DAgger collector queries exactly the same expert this records.
+    # The phase machine lives in expert_step().
     est = ExpertState(
         phase=phase,
         target_pos=target_pos,
@@ -713,14 +624,11 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
         compensate_gravity(model, data, [left_subtree_id, right_subtree_id, third_subtree_id])
         mujoco.mj_step(model, data)
 
-        # --- capture training data every step ---
+        # Capture training data every step
         if record_training_data and step_count % record_every_n_steps == 0:
             state_a = np.concatenate([data.qpos[left_dof_ids], [gripper_qpos]])
             state_b = np.concatenate([data.qpos[right_dof_ids], [right_gripper_qpos]])
-            # Arm C's proprioception, same layout: six joint positions then the
-            # left finger. expert_step already computes and actuates action_c;
-            # without state_c and action_c recorded, C would be trained with
-            # images and no labels.
+            # Arm C's state, same layout: six joint positions, then the left finger.
             state_c = np.concatenate([data.qpos[third_dof_ids], [third_gripper_qpos]])
             action_a = np.concatenate([configuration.q[left_dof_ids], [gripper_ctrl]])
             action_b = np.concatenate([configuration.q[right_dof_ids], [right_gripper_ctrl]])
@@ -740,7 +648,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
                 phase=phase,
             )
 
-        # --- capture review video, sparsely (not every step, for speed) ---
+        # Capture review video, sparsely (not every step, for speed)
         if record_review_video and step_count % review_video_every_n_steps == 0:
             renderer.update_scene(data, camera=REVIEW_CAMERA)
             review_frames.append(renderer.render())
@@ -755,15 +663,7 @@ def run_episode(setup, box_x_range, box_y_range, max_steps=4500,
 
 
 def main():
-    """
-    Main function for testing the 3-arm handover environment.
-
-    You can customize the parameters below to test different scenarios:
-    - handover_only: Start with arm A already holding the box (True) or do full pick-up (False)
-    - max_steps: Maximum steps before timeout
-    - record_training_data: Whether to record episode data
-    - record_review_video: Whether to record video frames
-    """
+    """Run three-arm handover episodes, headless or in the interactive viewer."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Test 3-arm handover scripted policy")
@@ -854,9 +754,7 @@ def main():
 
 
 def run_episode_with_viewer(setup, box_x_range, box_y_range, max_steps=2000, handover_only=False):
-    """
-    Run one episode with the interactive MuJoCo viewer for real-time visualization.
-    """
+    """Run one episode in the interactive MuJoCo viewer."""
     model = setup["model"]
     data = setup["data"]
     configuration = setup["configuration"]

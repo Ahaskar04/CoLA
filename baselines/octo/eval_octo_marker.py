@@ -1,22 +1,11 @@
-"""Octo baseline on the HIDDEN-MARKER handover, through CoLA's own harness.
+"""Octo baseline on the hidden-marker handover, scored by CoLA's own harness.
 
-Generated from /home/users/ntu/ahaskar0/CoLA/training/handover_2arm_marker/cola_eval_marker.py
-by replacing only the model-specific parts -- loading the policies and the
-per-chunk forward pass. The reset (handover_start keyframe + marker), the
-transfer / settle-in-tray criterion, the correct / wrong / no-tray split, the
-per-colour breakdown and the summary are CoLA's code unchanged, so an Octo
-number and a CoLA number are scored identically. check_criterion() re-verifies
-that at start-up and refuses to run if CoLA's evaluator has since changed.
+Only policy loading and the forward pass differ from eval/eval_marker.py.
+Reset, success criterion and summary are CoLA's code, and check_criterion()
+refuses to run if they have drifted. Runs two independent per-arm policies (no
+channel), or one centralised policy with --centralised.
 
-Two decentralised policies, one per arm, each seeing the camera it was trained
-on (its own wrist camera for the marker runs) and its own proprioception.
-B never sees the marker and there is no channel, so correct-tray given a
-completed handover should sit near chance (33.3%) unless A's behaviour leaks
-the colour.
-
-Episodes can be sharded with --seed-offset (colours cycle on offset + episode,
-so 0/50/100 x 50 is exactly CoLA's 150-episode 50/50/50 set) and recombined
-with --merge, which reruns the same summary code over the pooled episodes.
+Shard with --seed-offset; pool shards with --merge.
 """
 import argparse
 import json
@@ -32,20 +21,21 @@ import mujoco
 import numpy as np
 from tqdm import tqdm
 
-COLA_EVAL_DIR = '/home/users/ntu/ahaskar0/CoLA/training/handover_2arm_marker'
-sys.path.insert(0, COLA_EVAL_DIR)
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / 'eval'))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cola_eval_marker import (                             # noqa: E402
+from eval_marker import (                                  # noqa: E402
     CHUNK_SIZE, CONTROL_DECIMATION, GRIPPER_OPEN, GRIPPER_OPEN_FRAC, HOLD_STEPS,
     LIFT_Z, MARKER_COLORS, SCENE_XML, SETTLE_STEPS, TRAY_RADIUS, TRAY_Z_MAX,
     apply_action, build_scene, compensate_gravity, reset_episode, touching_box,
     which_tray)
-import eval_octo as E                                      # noqa: E402
-from eval_octo_finetuned import (                          # noqa: E402
+import eval_octo_zeroshot as E                             # noqa: E402
+from eval_octo_2arm import (                               # noqa: E402
     CentralisedOctoPolicy, FinetunedOctoPolicy)
 
-COLA_SOURCE = '/home/users/ntu/ahaskar0/CoLA/training/handover_2arm_marker/cola_eval_marker.py'
+COLA_SOURCE = str(REPO / 'eval' / 'eval_marker.py')
+RESULTS_DIR = REPO / 'results' / 'octo_marker'
 # Markers are assembled so this file's own copies of them do not match first.
 _SCORE_START = ' ' * 12 + 'for k in range(' + 'CHUNK_SIZE):'
 _SCORE_END = ' ' * 4 + 'renderer.' + 'close()'
@@ -72,12 +62,7 @@ def check_criterion():
 
 def merge(shards, results_path):
     """Pool sharded runs and rerun the summary over all their episodes."""
-    # Keep each shard WITH its own path. Sorting the paths separately and
-    # zipping them against offset-sorted data pairs lexicographic order against
-    # numeric order, so results_shard100.json gets recorded as seed_offset 25
-    # once there are more than two shards. The pooled episodes were always
-    # right -- they come from the sorted data -- but the provenance list lied,
-    # and with per-seed offsets there are far more shards to mislabel.
+    # Keep each shard with its own path, sorted by seed offset.
     parts = sorted(((p, json.load(open(p))) for p in shards),
                    key=lambda pr: pr[1]['seed_offset'])
     merged = {k: v for k, v in parts[0][1].items()
@@ -98,8 +83,8 @@ def merge(shards, results_path):
 
 def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
                          scene_xml=SCENE_XML, save_videos=True,
-                         video_dir='evaluation_videos_octo_marker',
-                         results_path='logs/octo_eval_marker_results.json',
+                         video_dir=str(RESULTS_DIR / 'videos'),
+                         results_path=str(RESULTS_DIR / 'results.json'),
                          max_control_steps=400, video_camera='side_cam',
                          seed_offset=0, seed=0, centralised=False):
 
@@ -116,18 +101,8 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
         videos_dir.mkdir(parents=True, exist_ok=True)
 
     if centralised:
-        # ONE 14-d policy drives both arms. CentralisedOctoPolicy.act() slices
-        # its own output by arm['prefix'] -- left takes columns 0:7, right 7:14,
-        # following ARM_SPEC['both'] = (action_a, action_b) -- so handing the
-        # SAME object in as both policy_a and policy_b gives each arm its own
-        # half. This mirrors eval_octo_finetuned.py's --centralised path, which
-        # passes pa twice for the same reason.
-        #
-        # On THIS task the centralised row is the upper bound that matters:
-        # arm B cannot see the marker from its own wrist, so a decentralised
-        # pair can only guess the tray (30.3% against a 33.3% chance rate),
-        # whereas one network holding arm A's view has the colour available to
-        # the same forward pass that commands arm B.
+        # One 14-d policy drives both arms: act() slices its output by
+        # arm['prefix'], so the same object serves as policy_a and policy_b.
         print('\n1. Loading ONE centralised Octo policy (14-d, drives both arms)...')
         policy_a = policy_b = CentralisedOctoPolicy(
             checkpoint_a, None, None, None, seed + seed_offset, False)
@@ -136,13 +111,8 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
             f'--centralised needs a 14-d checkpoint; this one emits {n_out}')
         assert policy_a.meta.get('arm') == 'both', (
             f"centralised checkpoint has arm={policy_a.meta.get('arm')!r}, expected 'both'")
-        # CentralisedOctoPolicy.act() slices its 14-d output on arm['prefix']
-        # (left -> 0:7, right -> 7:14), but cola_eval_marker.build_scene() does
-        # not store that key: it builds the arms as arm('left') / arm('right')
-        # and keeps only actuators/qadr/subtree/... . Without this the very
-        # first act() raises KeyError: 'prefix'. Injected here rather than in
-        # build_scene so the CoLA harness stays byte-identical to the source
-        # the startup drift-check diffs against. See the scene setup below.
+        # act() needs arm['prefix'], which build_scene() doesn't store; it is
+        # added below so the CoLA harness itself stays unchanged.
     else:
         print('\n1. Loading Octo policies (one per arm, no channel)...')
         policy_a = FinetunedOctoPolicy(checkpoint_a, seed=seed + seed_offset)
@@ -152,7 +122,7 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
     assert E.CHUNK_SIZE == CHUNK_SIZE, (
         f'Octo executes {E.CHUNK_SIZE} steps per query but the CoLA harness '
         f'chunks {CHUNK_SIZE}; the control cadence would differ.')
-    # Names the results dict below records, kept so that block stays CoLA's.
+    # Recorded in results, as in CoLA's evaluator.
     use_messages = False
     use_overhead = 'overhead_cam' in (policy_a.camera, policy_b.camera)
     print(f'   cameras: a={policy_a.camera}  b={policy_b.camera}')
@@ -187,10 +157,10 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep in tqdm(range(n_episodes), desc='Evaluating'):
-        # Same cycling the collection used, so the eval is colour-balanced by
-        # construction: 150 episodes is exactly 50/50/50.
+        # Colours cycle with the episode index, so the eval is balanced.
         color = MARKER_COLORS[(seed_offset + ep) % len(MARKER_COLORS)]
         reset_episode(scene, scene_xml, color)
+        donor_color = None  # no message swap here; kept so results match eval_marker.py
 
         frames = []
         transfer_done = False
@@ -200,11 +170,8 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
         control_step = 0
 
         while control_step < max_control_steps and landed is None:
-            # Two independent Octo policies. Each renders ITS OWN training
-            # camera (from its checkpoint metadata) and reads only its own
-            # proprio; nothing passes between them. act() returns CHUNK_SIZE
-            # absolute joint targets plus the gripper command in actuator
-            # units -- what apply_action writes -- so no denormalise step.
+            # Two independent policies, each with its own training camera and
+            # proprio. act() returns CHUNK_SIZE actions in actuator units.
             chunk_a = policy_a.act(scene, renderer, scene['a'])
             chunk_b = policy_b.act(scene, renderer, scene['b'])
 
@@ -234,9 +201,7 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
                     if transfer_run >= HOLD_STEPS:
                         transfer_done = True
                 else:
-                    # Require the box to REST in a tray for a few steps, so a
-                    # box passing through the region on its way elsewhere does
-                    # not score.
+                    # The box must rest in a tray for SETTLE_STEPS to count.
                     tray = which_tray(box)
                     if tray is not None and not b_holds:
                         settle_run += 1
@@ -268,6 +233,7 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
         results['episodes'].append({
             'episode': ep, 'marker_color': color, 'landed_tray': landed,
             'correct': bool(correct), 'transfer_done': bool(transfer_done),
+            'donor_color': donor_color,
             'control_steps': control_step,
             'final_box_pos': [float(v) for v in box],
         })
@@ -285,14 +251,11 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
     n_tray = sum(e['landed_tray'] is not None for e in eps)
     n_xfer = sum(e['transfer_done'] for e in eps)
 
-    # Per-colour, because a policy that always picks one tray scores ~33%
-    # overall and looks like partial information. The per-colour split exposes
-    # that: a constant policy is 100/0/0, real information is balanced.
+    # Per-colour breakdown: a policy that always picks one tray shows up here.
     by_color = {}
     for c in MARKER_COLORS:
         sub = [e for e in eps if e['marker_color'] == c]
-        # Conditioned on transfer for the same reason as the headline: an
-        # episode that never handed the box over says nothing about routing.
+        # Conditioned on a completed handover, like the headline.
         sub_x = [e for e in sub if e['transfer_done']]
         by_color[c] = {
             'n': len(sub),
@@ -303,28 +266,21 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
                       for t in MARKER_COLORS + [None]},
         }
 
-    # Correct answers among episodes where the handover actually completed.
-    # THIS IS THE HEADLINE NUMBER. A policy cannot route a box it never
-    # received, so raw correct_rate conflates two unrelated abilities:
-    # manipulation (can B take the box?) and routing (does B know where it
-    # goes?). Only the second is about communication. The no-messages control
-    # made this concrete -- it failed the physical handover in 93% of episodes,
-    # so its raw 1.5% mostly measured a broken grasp, not a missing colour.
+    # Headline: correct tray among completed handovers, which separates
+    # routing (communication) from manipulation.
     n_correct_xfer = sum(e['correct'] for e in eps if e['transfer_done'])
     correct_given_xfer = (100.0 * n_correct_xfer / n_xfer) if n_xfer else None
 
     results['summary'] = {
         'n_episodes': n,
-        # Report this FIRST: correct tray among completed handovers.
+        # Headline metric.
         'correct_given_transfer': correct_given_xfer,
         'n_transfers': n_xfer,
         'n_correct_given_transfer': n_correct_xfer,
         'correct_rate': 100.0 * n_correct / n,
         'tray_rate': 100.0 * n_tray / n,
         'transfer_rate': 100.0 * n_xfer / n,
-        # Narrower still: of the times B placed the box ANYWHERE, how often was
-        # it the right tray? Differs from correct_given_transfer only by the
-        # episodes that transferred but never reached a tray.
+        # Correct among episodes that reached any tray.
         'correct_given_tray': (100.0 * n_correct / n_tray) if n_tray else None,
         'chance_rate': 100.0 / len(MARKER_COLORS),
         'by_color': by_color,
@@ -382,7 +338,7 @@ if __name__ == '__main__':
     p.add_argument('--episodes', type=int, default=150)
     p.add_argument('--scene-xml', default=SCENE_XML)
     p.add_argument('--no-videos', action='store_true')
-    p.add_argument('--video-dir', default='evaluation_videos_octo_marker')
+    p.add_argument('--video-dir', default=str(RESULTS_DIR / 'videos'))
     p.add_argument('--results-path', required=True)
     p.add_argument('--max-control-steps', type=int, default=400)
     p.add_argument('--camera', default='side_cam')

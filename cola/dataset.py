@@ -1,9 +1,7 @@
-"""
-COLA Dataset Loader (pre-extracted features + action chunking).
+"""Two-arm dataset: cached Octo-Base features and action chunks.
 
-Loads 768-dim Octo-Base features (pre-extracted by extract_features.py)
-and actions from the cache directory. Samples CHUNK_SIZE consecutive
-actions per sample while respecting episode boundaries.
+Loads 768-d features (from extract_features_2arm.py) and actions from the cache,
+and samples CHUNK_SIZE consecutive actions that stay within one episode.
 """
 
 import numpy as np
@@ -13,14 +11,11 @@ from threading import Thread
 from queue import Queue
 
 
-CHUNK_SIZE = 10  # must match cola_architecture.CHUNK_SIZE
+CHUNK_SIZE = 10  # must match cola.model.CHUNK_SIZE
 
 
 def _build_valid_start_indices(episode_lens: np.ndarray, chunk_size: int) -> np.ndarray:
-    """
-    Given concatenated episode lengths, return global timestep indices where
-    a chunk of `chunk_size` consecutive actions stays within one episode.
-    """
+    """Global indices where a chunk of `chunk_size` actions stays in one episode."""
     starts = np.concatenate([[0], np.cumsum(episode_lens)[:-1]])
     counts = np.clip(episode_lens - chunk_size + 1, a_min=0, a_max=None)
 
@@ -33,9 +28,7 @@ def _build_valid_start_indices(episode_lens: np.ndarray, chunk_size: int) -> np.
 
 
 class COLADataset:
-    """
-    Feature-based dataset: loads pre-extracted 768-dim Octo features (not images).
-    """
+    """Pre-extracted 768-d Octo features, actions and (optionally) states."""
 
     def __init__(
         self,
@@ -53,19 +46,18 @@ class COLADataset:
         cache_dir = Path(cache_dir)
         feat_dir = Path(feat_dir)
 
-        # Pre-extracted features (small — fits in RAM)
+        # Pre-extracted features (fit in RAM)
         print(f'[{split}] Loading pre-extracted features...')
         self.features_a = np.load(feat_dir / f'{split}_features_a.npy')
         self.features_b = np.load(feat_dir / f'{split}_features_b.npy')
 
-        # Proprioception, written by prepare_states_h5.py in manifest order so
-        # row i matches row i of the features and actions.
+        # States from prepare_states_2arm.py, row-aligned with features and actions.
         self.states_a = self.states_b = None
         if use_states:
             state_path = cache_dir / f'{split}_states_a.npy'
             if not state_path.exists():
                 raise FileNotFoundError(
-                    f'Missing {state_path}. Run prepare_states_h5.py first.'
+                    f'Missing {state_path}. Run prepare_states_2arm.py first.'
                 )
             self.states_a = np.load(state_path)
             self.states_b = np.load(cache_dir / f'{split}_states_b.npy')
@@ -108,9 +100,7 @@ class COLADataset:
             'action_b': self.actions_b[idx_grid],
         }
         if self.use_states:
-            # State at the query timestep only, matching the features: the
-            # policy conditions on where the arm is now, then predicts the whole
-            # chunk from there.
+            # State at the query timestep only, like the features.
             batch['state_a'] = self.states_a[start_indices]
             batch['state_b'] = self.states_b[start_indices]
         return batch
@@ -141,9 +131,10 @@ class COLADataset:
 
 
 if __name__ == '__main__':
+    data = Path(__file__).resolve().parents[1] / 'data'
     ds = COLADataset(
-        cache_dir='/scratch/users/ntu/ahaskar0/cola-research/cache_handover/',
-        feat_dir='/scratch/users/ntu/ahaskar0/cola-research/features_handover/',
+        cache_dir=data / 'cache' / 'handover_2arm',
+        feat_dir=data / 'features' / 'handover_2arm',
         split='train',
     )
     print(f'\nDataset size (valid chunk-starts): {len(ds)}')
