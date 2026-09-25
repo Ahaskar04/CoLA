@@ -80,7 +80,7 @@ Each episode is saved as `episode_XXXX.h5` together with a review video.
 ### 2. Build caches and extract frozen Octo-Base features
 
 ```bash
-python preprocess/main.py handover_2arm      # wrist + overhead cameras
+python preprocess/main.py handover_2arm      # 150 episodes, sampled with seed 42; wrist + overhead cameras
 python preprocess/main.py handover_marker    # wrist cameras only
 python preprocess/main.py handover_3arm      # 130 episodes, sampled with seed 42
 ```

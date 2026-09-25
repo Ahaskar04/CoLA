@@ -24,7 +24,7 @@ TASKS = {
         'cache': ['prepare_cache_2arm.py', 'prepare_states_2arm.py'],
         'features': 'extract_features_2arm.py',
         'overhead': True,
-        'max_episodes': 0,
+        'max_episodes': 150,
     },
     # Wrist cameras only: the marker is hidden from the overhead camera.
     'handover_marker': {
