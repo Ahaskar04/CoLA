@@ -66,8 +66,7 @@ def main():
     for c in COLORS:
         if not bank[c]:
             raise SystemExit(f"no donor episodes for colour {c!r}")
-        # Episodes are ragged, so store each separately (padding would feed B
-        # zeros, i.e. no message).
+        # Store episodes separately; padding them would feed B zeros (no message).
         out[f"{c}_n"] = np.int32(len(bank[c]))
         for i, arr in enumerate(bank[c]):
             out[f"{c}_{i}"] = arr.astype(np.float32)

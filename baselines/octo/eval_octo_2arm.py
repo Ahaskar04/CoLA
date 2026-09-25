@@ -68,7 +68,7 @@ class FinetunedOctoPolicy:
         self.exec_steps = min(self.horizon, E.CHUNK_SIZE)
         self.rng = jax.random.PRNGKey(seed)
 
-        # Interface compatibility only (absolute joint actions have no scale).
+        # Unused (absolute joint actions have no scale); kept for the shared interface.
         self.action_scale = 1.0
         self.stats_name = 'finetune'
         # Optionally snap the gripper to the two demonstrated values (0.002 / 0.037).
@@ -89,7 +89,7 @@ class FinetunedOctoPolicy:
         pass                      # window 1: no history to carry across episodes
 
     def _proprio(self, scene, arm):
-        """Exactly state_a/state_b as scripted_policy.py recorded them."""
+        """Joint state in the same layout as state_a/state_b in the demos."""
         d = scene['data']
         return np.concatenate([d.qpos[arm['qadr']], [d.qpos[arm['finger_qadr']]]])
 
@@ -115,7 +115,7 @@ class FinetunedOctoPolicy:
         actions = np.asarray(actions)[0]              # (horizon, 7)
 
         # Receding horizon: execute the first CHUNK_SIZE actions, then re-observe.
-        # np.array, not asarray: --gripper-snap writes into this.
+        # Copy, since --gripper-snap edits it in place.
         chunk = np.array(actions[:E.CHUNK_SIZE], dtype=np.float32)
 
         # Record the raw gripper command of every executed step.
@@ -131,7 +131,7 @@ class FinetunedOctoPolicy:
         return chunk
 
     def diagnostics(self):
-        # Empty: eval_octo_zeroshot's printout doesn't apply here; see joint_diagnostics().
+        # Nothing to report here; see joint_diagnostics().
         return {}
 
     def joint_diagnostics(self):
@@ -140,7 +140,7 @@ class FinetunedOctoPolicy:
         g = np.asarray(self.grip_values)
         mid = (E.GRIPPER_OPEN + E.GRIPPER_CLOSED) / 2
         gc = np.asarray(self.grip_chunk_values) > mid
-        # Percentiles show whether the gripper command is bimodal or hedging.
+        # Percentiles of the gripper command (bimodal, or stuck in between).
         return {
             'gripper_cmd_mean': float(g.mean()),
             'gripper_frac_open': float((g > mid).mean()),
@@ -222,7 +222,7 @@ CACHE_WRIST_FOV = {
 
 
 def check_wrist_fov(policy, scene_xml):
-    """Fail loudly when a wrist-trained checkpoint meets the wrong lens."""
+    """Raise if a wrist-trained checkpoint is used with a different camera FOV."""
     import numpy as np, mujoco
     cams = [c for c in (getattr(policy, 'camera', None),
                         getattr(policy, 'wrist_camera', None)) if c]

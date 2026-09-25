@@ -129,7 +129,7 @@ def build_cache(manifest=MANIFEST, cache=CACHE, max_len=64):
 
 class MarkerSplit:
     """Memory-mapped split with CoLA's epoch sampler, deterministic in the step
-    index so a resumed segment draws exactly the batches an unbroken run would."""
+    index, so a resumed run draws the same batches as an uninterrupted one."""
 
     def __init__(self, split, cache=CACHE, in_memory=True):
         # Loaded into memory by default (memory-mapped random reads were slow).

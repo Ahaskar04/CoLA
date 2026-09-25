@@ -51,7 +51,7 @@ class MessageDecoder(nn.Module):
 
 
 class ProprioEncoder(nn.Module):
-    """Embed the 7-d joint state so it isn't swamped by 768 vision dims."""
+    """Embed the 7-d joint state before it joins the 768-d vision features."""
     proprio_dim: int = PROPRIO_DIM
 
     @nn.compact
@@ -191,7 +191,7 @@ class ConditionalUnet1D(nn.Module):
         x = ConditionalResidualBlock1D(mid, self.kernel_size, self.n_groups)(x, cond)
 
         for dim, skip in zip(reversed(self.down_dims), reversed(skips)):
-            # Upsample, then trim to the skip's length (odd lengths don't double back).
+            # Upsample and trim to the skip's length (odd lengths don't round-trip).
             x = jnp.repeat(x, 2, axis=1)[:, :skip.shape[1]]
             x = jnp.concatenate([x, skip], axis=-1)
             x = ConditionalResidualBlock1D(dim, self.kernel_size, self.n_groups)(x, cond)
@@ -200,7 +200,7 @@ class ConditionalUnet1D(nn.Module):
         n_joint = self.action_dim - 1
         eps = nn.Conv(n_joint, kernel_size=(1,))(x)
 
-        # The binary gripper is predicted directly, outside the diffusion.
+        # The gripper is predicted directly (not diffused).
         g = nn.Dense(128)(combined_features)
         g = mish(g)
         g = nn.Dense(self.chunk_size)(g).reshape(-1, self.chunk_size, 1)
@@ -210,8 +210,8 @@ class ConditionalUnet1D(nn.Module):
 class DiffusionHead(nn.Module):
     """Residual-MLP denoiser over the joint columns of an action chunk.
 
-    Diffusion keeps multimodal actions apart where an L1 head would average
-    them. The binary gripper is not diffused; it gets a separate logit.
+    Diffusion can represent multimodal actions, which an L1 head averages.
+    The gripper is not diffused and gets its own logit.
     """
     action_dim: int = ACTION_DIM
     chunk_size: int = CHUNK_SIZE
@@ -233,7 +233,7 @@ class DiffusionHead(nn.Module):
 
         x = nn.Dense(self.hidden)(x)
         x = nn.relu(x)
-        # Residual blocks: a plain deep MLP trains poorly as a denoiser.
+        # Residual blocks (a plain deep MLP trained poorly as a denoiser).
         for _ in range(self.n_layers):
             h = nn.Dense(self.hidden)(x)
             h = nn.relu(h)
@@ -244,7 +244,7 @@ class DiffusionHead(nn.Module):
         eps = nn.Dense(self.chunk_size * n_joint)(x)
         eps = eps.reshape(b, self.chunk_size, n_joint)
 
-        # Gripper logits come straight from the features, not the diffusion.
+        # Gripper logits straight from the features (no diffusion).
         g = nn.Dense(128)(combined_features)
         g = nn.relu(g)
         g = nn.Dense(self.chunk_size)(g).reshape(b, self.chunk_size, 1)
@@ -265,6 +265,7 @@ class COLAModel:
         diffusion_unet: bool = False,
         unet_dims: tuple = None,
         message_dim: int = MESSAGE_DIM,
+        seed: int = 0,
     ):
         """
         use_proprio:    add each arm's own joint state to its features.
@@ -276,6 +277,7 @@ class COLAModel:
         diffusion_unet: 1D U-Net denoiser instead of the residual MLP.
         unet_dims:      U-Net channel widths per level; None keeps (128, 256).
         message_dim:    width of the message channel.
+        seed:           seed for the adapters' initial weights.
 
         The defaults keep older checkpoints loadable.
         """
@@ -296,11 +298,10 @@ class COLAModel:
         if use_diffusion:
             # Precomputed noise schedule.
             self.alpha_bars = cosine_alpha_bars(DIFFUSION_STEPS)
-            # Advanced on every forward() so each control step samples fresh noise.
+            # Split on every forward(), so each control step gets new noise.
             self._sample_rng = jax.random.PRNGKey(0)
 
-        # Adapters. message_dim is stored so eval can rebuild a checkpoint at
-        # the width it was trained with.
+        # Adapters. message_dim is saved so eval can rebuild the same width.
         self.message_dim = message_dim
         self.encoder_a = MessageEncoder(message_dim=message_dim)
         self.encoder_b = MessageEncoder(message_dim=message_dim)
@@ -320,12 +321,11 @@ class COLAModel:
             self.action_head_a = CoordinationHead(action_dim=ACTION_DIM, split_gripper=split_gripper)
             self.action_head_b = CoordinationHead(action_dim=ACTION_DIM, split_gripper=split_gripper)
 
-        rng = jax.random.PRNGKey(0)
+        rng = jax.random.PRNGKey(seed)
         dummy_message = jnp.ones((1, message_dim))
 
-        # Each arm's self-representation: its wrist and/or the overhead
-        # features, plus its embedded state when enabled. It feeds both the
-        # message encoder and the action head.
+        # Self-representation: wrist and/or overhead features, plus the embedded
+        # state if enabled. Input to both the message encoder and the action head.
         self_dim = ((FEATURE_DIM if use_wrist else 0)
                     + (FEATURE_DIM if use_overhead else 0)
                     + (PROPRIO_DIM if use_proprio else 0))
@@ -457,8 +457,8 @@ class COLAModel:
             msg_a = jnp.zeros_like(msg_a)
             msg_b = jnp.zeros_like(msg_b)
 
-        # Message-swap intervention: B receives a message recorded in another
-        # episode. Applied after zeroing, so an override always wins.
+        # Swap test: give B a message recorded in another episode. Done after the
+        # zeroing so the override is always used.
         if msg_a_override is not None:
             ov = jnp.asarray(msg_a_override)
             if ov.shape != msg_a.shape:
@@ -474,8 +474,7 @@ class COLAModel:
         combined_b = jnp.concatenate([self_b, decoded_a], axis=-1)
 
         if self.use_diffusion:
-            # Sample a chunk with the reverse process. The RNG advances every
-            # call so control steps don't reuse the same noise.
+            # Sample a chunk with the reverse process, with new noise every call.
             self._sample_rng, k_a, k_b = jax.random.split(self._sample_rng, 3)
             action_a = self.sample_actions(combined_a, params, 'a', k_a)
             action_b = self.sample_actions(combined_b, params, 'b', k_b)
@@ -553,8 +552,8 @@ class COLAModel:
             msg_a = jnp.zeros_like(msg_a)
             msg_b = jnp.zeros_like(msg_b)
 
-        # Message-swap intervention: B receives a message recorded in another
-        # episode. Applied after zeroing, so an override always wins.
+        # Swap test: give B a message recorded in another episode. Done after the
+        # zeroing so the override is always used.
         if msg_a_override is not None:
             ov = jnp.asarray(msg_a_override)
             if ov.shape != msg_a.shape:
@@ -570,8 +569,8 @@ class COLAModel:
         combined_b = jnp.concatenate([self_b, decoded_a], axis=-1)
 
         if self.use_diffusion:
-            # Diffusion: return the conditioning vectors; the trainer and the
-            # sampler drive the head themselves.
+            # With diffusion, return the conditioning vectors; the trainer and the
+            # sampler call the head themselves.
             return combined_a, combined_b
 
         action_a = self.action_head_a.apply(params['action_head_a'], combined_a)

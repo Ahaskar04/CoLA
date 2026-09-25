@@ -123,7 +123,7 @@ def plot_loss_curves(train_losses, val_losses, best_epoch, save_path):
 # Device-resident dataset
 
 def _find_state_files(cache_dir, split):
-    """Locate the cached proprioception arrays, whatever they are called."""
+    """Find the cached state arrays (older caches used other file names)."""
     for pattern in STATE_FILE_PATTERNS:
         pa = Path(cache_dir) / pattern.format(split=split, arm='a')
         pb = Path(cache_dir) / pattern.format(split=split, arm='b')
@@ -286,7 +286,7 @@ def make_loss_fn(model, cfg):
         ab = model.alpha_bars
         total = 0.0
         parts = {}
-        # Validation passes rng=None; a fixed key keeps val loss comparable.
+        # Validation passes rng=None and uses a fixed key, so val losses compare.
         base = rng if rng is not None else jax.random.PRNGKey(0)
 
         for tag, cond, target in (('a', cond_a, batch['action_a']),
@@ -326,7 +326,7 @@ def make_loss_fn(model, cfg):
         state_a = batch['state_a'] if use_proprio else None
         state_b = batch['state_b'] if use_proprio else None
 
-        # Proprio dropout (training only), so the policy can't ignore vision.
+        # Proprio dropout during training, so the policy has to use vision too.
         if use_proprio and rng is not None and p_drop > 0:
             k1, k2 = jax.random.split(rng)
             keep_a = (jax.random.uniform(k1, (state_a.shape[0], 1)) >= p_drop)
@@ -338,8 +338,7 @@ def make_loss_fn(model, cfg):
             batch['features_a'], batch['features_b'],
             params=params, proprio_a=state_a, proprio_b=state_b,
             features_o=batch.get('features_o'),
-            # False zeros message content only, so the parameter count is
-            # unchanged (no-message ablation).
+            # No-message ablation: the messages are zeroed, the parameters stay.
             use_messages=use_messages,
         )
 
@@ -436,7 +435,7 @@ class EEMetric:
 
     def _ee(self, q):
         self.mujoco.mj_resetDataKeyframe(self.model, self.data, self.key)
-        # Deltas are applied from the home pose, the one reference both share.
+        # Integrate deltas from the home pose, for prediction and target alike.
         self.data.qpos[self.qadr] = (self.home_q + q) if self.velocity else q
         self.mujoco.mj_forward(self.model, self.data)
         return self.data.site('left/gripper').xpos.copy()
@@ -483,7 +482,7 @@ def train_epoch(train_step, params, opt_state, dataset, rng, batch_size,
                  leave=False)):
         params, opt_state, rng, loss, parts = train_step(params, opt_state, batch, rng)
 
-        # Device-side accumulation: no host sync until the epoch ends.
+        # Accumulate on device; sync with the host once per epoch.
         acc = {'loss': loss, **parts}
         sums = acc if sums is None else jax.tree_util.tree_map(jnp.add, sums, acc)
 
@@ -610,7 +609,7 @@ def train_cola(
     test_dataset = DeviceDataset(cache_dir, feat_dir, 'test', use_proprio, logger=logger,
                   use_overhead=use_overhead)
 
-    # Gripper class prior: the baseline for gripper accuracy.
+    # Gripper class prior, the chance level for gripper accuracy.
     grip_train = np.asarray(jax.device_get(train_dataset.act_a[:, GRIPPER_IDX]))
     prior = float((grip_train > 0).mean())
     logger.info(f'  gripper class balance (arm A, train): {prior:.3f} open / '
@@ -619,7 +618,7 @@ def train_cola(
     logger.info('\n2. Initializing COLA model...')
     model = COLAModel(use_proprio=use_proprio, split_gripper=True,
                       use_overhead=use_overhead, use_diffusion=use_diffusion,
-                      diffusion_unet=diffusion_unet, unet_dims=unet_dims)
+                      diffusion_unet=diffusion_unet, unet_dims=unet_dims, seed=seed)
     if not use_messages:
         logger.info('  messages: SEVERED (L0 ablation) -- each arm sees only '
                     'its own features; evaluate this checkpoint with '
@@ -706,7 +705,7 @@ def train_cola(
                 'use_proprio': use_proprio,
                 'use_overhead': use_overhead,
                 'split_gripper': True,
-                # Top level, so the evaluator can refuse a mismatched message setting.
+                # Checked by the evaluator against --no-messages.
                 'use_messages': use_messages,
                 'config': cfg,
                 # Data provenance.

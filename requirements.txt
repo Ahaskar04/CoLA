@@ -6,6 +6,9 @@
 # Core ML frameworks
 tensorflow==2.15.0
 tensorflow-probability==0.23.0
+# Octo's tensorflow_datasets otherwise pulls a newer one that needs protobuf 5,
+# which tensorflow 2.15 excludes.
+tensorflow-metadata==1.15.0
 
 # JAX ecosystem (Octo)
 jax==0.4.20

@@ -6,9 +6,9 @@ colour (chance 1 in 3), with folds grouped by episode, on three inputs:
     self_a   the encoder's input (ceiling)
     msg_a    the message
     msg_a    from the no-message checkpoint (control)
-Reports frame accuracy and per-episode majority-vote accuracy. Decodability
-shows the colour is present in the message, not that B uses it; the
-message-swap intervention tests that. CPU only.
+Reports frame accuracy and per-episode majority-vote accuracy. A decodable
+colour is in the message, but B may still ignore it; the swap test in
+eval_marker.py checks whether B uses it. CPU only.
 """
 
 import argparse
@@ -164,7 +164,7 @@ def probe(X_tr, y_tr, ep_tr, X_te, y_te, ep_te, seed=0):
     pred = clf.predict(sc.transform(X_te))
     frame_acc = float((pred == y_te).mean())
 
-    # Per-episode majority vote: the policy commits to one tray per episode.
+    # Majority vote per episode, since the policy picks one tray per episode.
     ep_correct = ep_total = 0
     for e in np.unique(ep_te):
         m = ep_te == e

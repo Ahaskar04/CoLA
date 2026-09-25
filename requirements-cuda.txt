@@ -1,0 +1,16 @@
+# CUDA build of JAX 0.4.20 and the CUDA 12.3 / cuDNN 8.9 libraries it was built
+# for. Left unpinned, jax[cuda12_pip] pulls cuDNN 9, which this jaxlib cannot
+# load. Install with: pip install -r requirements-cuda.txt
+--find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+jax[cuda12_pip]==0.4.20
+jaxlib==0.4.20+cuda12.cudnn89
+nvidia-cudnn-cu12==8.9.7.29
+nvidia-cublas-cu12==12.3.4.1
+nvidia-cuda-cupti-cu12==12.3.101
+nvidia-cuda-nvcc-cu12==12.3.107
+nvidia-cuda-runtime-cu12==12.3.101
+nvidia-cufft-cu12==11.0.12.1
+nvidia-cusolver-cu12==11.5.4.101
+nvidia-cusparse-cu12==12.2.0.103
+nvidia-nccl-cu12==2.19.3
+nvidia-nvjitlink-cu12==12.3.101

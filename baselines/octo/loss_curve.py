@@ -11,7 +11,7 @@ try:
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     HAS_MPL = True
-except ImportError:            # plotting must never be able to kill a run
+except ImportError:            # don't let a plotting error kill the run
     HAS_MPL = False
 
 

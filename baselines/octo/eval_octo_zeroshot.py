@@ -1,14 +1,14 @@
 """Evaluate pretrained (frozen) Octo on the ALOHA handover scene.
 
-Tests whether pretrained Octo can pick up the box here at all (headline:
-a_lift_rate). Scoring and summary are eval_2arm.py's code, and
-check_criterion() refuses to run if they have drifted.
+Checks whether pretrained Octo can pick up the box in this scene (main
+number: a_lift_rate). Scoring and summary are copied from eval_2arm.py, and
+check_criterion() exits if the copies no longer match.
 
 Octo emits normalised 7-d delta end-effector actions; this robot takes
 absolute joint targets. The bridge unnormalises with --octo-dataset
 statistics, converts position deltas to joint targets with the expert's IK
 (orientation deltas are discarded) and rescales by the uncalibrated
---action-scale, so a low score may reflect the bridge rather than Octo.
+--action-scale, so part of a low score may come from the bridge.
 
 Usage:
     python eval_octo_zeroshot.py --probe-actions --episodes 5     # raw action scale only
@@ -37,7 +37,7 @@ EXPERT_DIR = str(REPO / 'data_collection' / 'handover_2arm')
 RESULTS_DIR = REPO / 'results' / 'octo_zeroshot'
 COLA_SOURCE = str(REPO / 'eval' / 'eval_2arm.py')
 
-# Markers are assembled so this file's own copies of them do not match first.
+# Built from pieces so the search doesn't match these lines themselves.
 _SCORE_START = ' ' * 12 + 'for k in range(' + 'n_exec):'
 _SCORE_END = ' ' * 4 + 'renderer.' + 'close()'
 _SUM_START = ' ' * 4 + 'scored = len(' + "results['episodes'])"
@@ -50,7 +50,7 @@ def _block(text, start, end):
 
 
 def check_criterion():
-    """Refuse to run if the scoring or summary code no longer matches CoLA's."""
+    """Exit if the scoring or summary code differs from CoLA's."""
     cola = Path(COLA_SOURCE).read_text()
     mine = Path(__file__).read_text()
     for name, s, e in (('scoring loop', _SCORE_START, _SCORE_END),
@@ -634,14 +634,14 @@ def evaluate(
         'a_touched_count': 0,
         'b_touched_count': 0,
         'skipped': 0,
-        # Recorded rather than inferred from the run tag.
+        # Stored in the results so it doesn't have to be guessed from the run name.
         'handover_only': bool(handover_only),
         # Episodes are seeded seed_offset + ep_idx, as in eval_2arm.py.
         'seed_offset': int(seed_offset),
     }
 
-    # Octo emits absolute joint targets; the shared scoring block below also
-    # handles CoLA's velocity caches.
+    # Octo outputs absolute joint targets. The flag exists because the scoring
+    # code is shared with eval_2arm.py.
     velocity_actions = False
 
     print(f'\n3. Running {n_episodes} episodes...')
@@ -684,20 +684,19 @@ def evaluate(
             else:
                 chunk_b = hold_chunk(scene, scene['b'])
 
-            # Execute only what was predicted; a shorter head means re-querying sooner.
+            # Run at most CHUNK_SIZE steps, fewer if the policy predicted fewer.
             n_exec = min(len(chunk_a), len(chunk_b), CHUNK_SIZE)
             for k in range(n_exec):
                 if control_step >= max_control_steps:
                     break
 
                 if velocity_actions:
-                    # Velocity actions are deltas: add them to the current
-                    # joint positions, read fresh each step.
+                    # Velocity actions are deltas on the current joint positions.
                     step_a = chunk_a[k].copy()
                     step_b = chunk_b[k].copy()
                     step_a[:6] = data.qpos[scene['a']['qadr']] + step_a[:6]
                     step_b[:6] = data.qpos[scene['b']['qadr']] + step_b[:6]
-                    # Column 6 is the gripper and was never differenced.
+                    # Column 6 (gripper) is absolute, not a delta.
                     apply_action(data, scene['a'], step_a)
                     apply_action(data, scene['b'], step_b)
                 else:
@@ -723,7 +722,7 @@ def evaluate(
                     min_a_box_dist,
                     float(np.linalg.norm(data.site(scene['a']['site']).xpos - box_pos)))
 
-                # A has genuinely let go, not merely lost contact for a frame.
+                # A's gripper must be open too (contact alone can flicker).
                 a_open = (float(data.qpos[scene['a']['finger_qadr']])
                           > GRIPPER_OPEN * GRIPPER_OPEN_FRAC)
                 b_has_box = b_holds and box_z > LIFT_Z
@@ -742,8 +741,9 @@ def evaluate(
                         if criterion == 'transfer':
                             success = True
                 else:
-                    # Phase 2: keep it (and optionally go home). The drop test
-                    # keys on contact: B may carry the box low on the way back.
+                    # Phase 2: hold the box (and optionally go home). Drops are
+                    # detected by contact, since B may carry the box low on the
+                    # way back.
                     no_contact_run = 0 if b_holds else no_contact_run + 1
                     if no_contact_run >= DROP_STEPS:
                         dropped = True
@@ -821,16 +821,16 @@ def evaluate(
 
     results['summary'] = {
         'n_episodes': n_episodes,
-        # Episodes played: those whose start-state grasp failed are not scored.
+        # Scored episodes (skipped ones excluded).
         'n_scored': scored,
         'success_rate': 100.0 * results['task_successes'] / denom,
         # Phase 1 only.
         'transfer_rate': 100.0 * results['transfer_count'] / denom,
         'drop_rate': 100.0 * results['drop_count'] / denom,
-        # Of the episodes that transferred, how many then lost the box.
+        # Drops among the episodes that transferred.
         'drop_given_transfer': (100.0 * results['drop_count'] / len(transferred)
                                 if transferred else None),
-        # Pick-up (the zero-shot Octo headline).
+        # Pick-up rates (the main zero-shot Octo numbers).
         'a_lift_rate': 100.0 * results['a_lifted_count'] / denom,
         'a_touch_rate': 100.0 * results['a_touched_count'] / denom,
         'b_touch_rate': 100.0 * results['b_touched_count'] / denom,

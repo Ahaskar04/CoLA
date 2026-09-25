@@ -98,7 +98,8 @@ def _key(k) -> str:
 def is_cola_param(path, modules=COLA_MODULES) -> bool:
     """Parameters that belong to CoLA's channel rather than to pi0.5.
 
-    Exact module names: a prefix match would also catch SigLIP's `encoder_norm`.
+    Matched by exact module name; a prefix match would also catch SigLIP's
+    `encoder_norm`.
     """
     return any(_key(k) in modules for k in path)
 
@@ -221,7 +222,7 @@ class ColaPi05(_pi0.Pi0):
             time = time + dt
         return x_t[:n], x_t[n:]
 
-    # pi0's single-observation entry points make no sense for a two-arm model.
+    # pi0's single-observation entry points don't apply to a two-arm model.
     @override
     def compute_loss(self, *args, **kwargs):
         raise NotImplementedError("use compute_cola_loss(rng, obs_a, obs_b, actions_a, actions_b)")

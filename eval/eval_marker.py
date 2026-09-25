@@ -452,11 +452,11 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
     n_tray = sum(e['landed_tray'] is not None for e in eps)
     n_xfer = sum(e['transfer_done'] for e in eps)
 
-    # Per-colour breakdown: a policy that always picks one tray shows up here.
+    # Per-colour breakdown (catches a policy that always picks the same tray).
     by_color = {}
     for c in MARKER_COLORS:
         sub = [e for e in eps if e['marker_color'] == c]
-        # Conditioned on a completed handover, like the headline.
+        # Only episodes with a completed handover, as in the main metric.
         sub_x = [e for e in sub if e['transfer_done']]
         by_color[c] = {
             'n': len(sub),
@@ -467,14 +467,12 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
                       for t in MARKER_COLORS + [None]},
         }
 
-    # Headline: correct tray among completed handovers, which separates
-    # routing (communication) from manipulation.
+    # Main metric: correct tray out of the episodes where the handover happened.
     n_correct_xfer = sum(e['correct'] for e in eps if e['transfer_done'])
     correct_given_xfer = (100.0 * n_correct_xfer / n_xfer) if n_xfer else None
 
     results['summary'] = {
         'n_episodes': n,
-        # Headline metric.
         'correct_given_transfer': correct_given_xfer,
         'n_transfers': n_xfer,
         'n_correct_given_transfer': n_correct_xfer,
@@ -491,7 +489,7 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
     print('\n' + '=' * 64)
     print('RESULTS')
     print('=' * 64)
-    # Headline: routing skill with manipulation factored out.
+    # Main metric.
     if correct_given_xfer is not None:
         print(f"CORRECT | HANDOVER: {n_correct_xfer}/{n_xfer} = "
               f"{correct_given_xfer:.1f}%   (chance {s['chance_rate']:.1f}%)")

@@ -3,7 +3,7 @@
 CoLA's adapters, message channel and U-Net head run on the 2048-d masked-mean
 PaliGemma prefix of a frozen pi0.5 (the features extract_pi05_features.py
 writes for training). Reset, success criterion and summary are CoLA's
-evaluator code (check_criterion() verifies).
+evaluator code (checked by check_criterion()).
 
 Runs in the openpi environment with MuJoCo 3.12.0 (as used for CoLA's evals).
 """
@@ -46,7 +46,7 @@ cache_dir_pi05 = str(REPO / 'data' / 'cache' / 'handover_marker_pi05')
 
 COLA_SOURCE = str(REPO / 'eval' / 'eval_marker.py')
 RESULTS_DIR = REPO / 'results' / 'cola_pi05_frozen'
-# Markers are assembled so this file's own copies of them do not match first.
+# Built from pieces so the search doesn't match these lines themselves.
 _SCORE_START = ' ' * 12 + 'for k in range(' + 'CHUNK_SIZE):'
 _SCORE_END = ' ' * 4 + 'renderer.' + 'close()'
 _SUM_START = ' ' * 4 + "eps = results[" + "'episodes']"
@@ -59,7 +59,7 @@ def _block(text, start, end):
 
 
 def check_criterion():
-    """Refuse to run if the scoring or summary code no longer matches CoLA's."""
+    """Exit if the scoring or summary code differs from CoLA's."""
     cola = Path(COLA_SOURCE).read_text()
     mine = Path(__file__).read_text()
     for name, s, e in (('scoring loop', _SCORE_START, _SCORE_END),
@@ -71,7 +71,7 @@ def check_criterion():
 
 
 def merge(shards, results_path):
-    """Pool sharded runs and rerun the summary over all their episodes."""
+    """Merge sharded runs and recompute the summary."""
     # Keep each shard with its own path, sorted by seed offset.
     parts = sorted(((p, json.load(open(p))) for p in shards),
                    key=lambda pr: pr[1]['seed_offset'])
@@ -325,18 +325,18 @@ def evaluate_cola_pi05_marker(model_path, cache_dir=CACHE_DIR, n_episodes=150,
 
 
 def _summarise(results, results_path, save_videos=False, videos_dir=None):
-    """CoLA's summary and printout, verbatim (check_criterion verifies)."""
+    """Summary and printout copied from eval_marker.py (checked by check_criterion)."""
     eps = results['episodes']
     n = len(eps)
     n_correct = sum(e['correct'] for e in eps)
     n_tray = sum(e['landed_tray'] is not None for e in eps)
     n_xfer = sum(e['transfer_done'] for e in eps)
 
-    # Per-colour breakdown: a policy that always picks one tray shows up here.
+    # Per-colour breakdown (catches a policy that always picks the same tray).
     by_color = {}
     for c in MARKER_COLORS:
         sub = [e for e in eps if e['marker_color'] == c]
-        # Conditioned on a completed handover, like the headline.
+        # Only episodes with a completed handover, as in the main metric.
         sub_x = [e for e in sub if e['transfer_done']]
         by_color[c] = {
             'n': len(sub),
@@ -347,14 +347,12 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
                       for t in MARKER_COLORS + [None]},
         }
 
-    # Headline: correct tray among completed handovers, which separates
-    # routing (communication) from manipulation.
+    # Main metric: correct tray out of the episodes where the handover happened.
     n_correct_xfer = sum(e['correct'] for e in eps if e['transfer_done'])
     correct_given_xfer = (100.0 * n_correct_xfer / n_xfer) if n_xfer else None
 
     results['summary'] = {
         'n_episodes': n,
-        # Headline metric.
         'correct_given_transfer': correct_given_xfer,
         'n_transfers': n_xfer,
         'n_correct_given_transfer': n_correct_xfer,
@@ -371,7 +369,7 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
     print('\n' + '=' * 64)
     print('RESULTS')
     print('=' * 64)
-    # Headline: routing skill with manipulation factored out.
+    # Main metric.
     if correct_given_xfer is not None:
         print(f"CORRECT | HANDOVER: {n_correct_xfer}/{n_xfer} = "
               f"{correct_given_xfer:.1f}%   (chance {s['chance_rate']:.1f}%)")

@@ -249,7 +249,7 @@ def reset_episode_handover(scene, seed: int, scene_xml: str):
     if not check_gripper_box_contact(m, d):
         return False
 
-    # Copy the constructed state into the scene the policy actually runs in.
+    # Copy the start state into the scene used for the rollout.
     scene['data'].qpos[:] = d.qpos
     scene['data'].qvel[:] = 0.0
     scene['data'].ctrl[:] = d.ctrl
@@ -397,7 +397,7 @@ def evaluate_cola(
         success = False
         control_step = 0
 
-        # Cheap diagnostics -- make a failure attributable without a re-run.
+        # Extra diagnostics, to tell failure modes apart.
         max_box_z = 0.0
         max_ab_run = 0
         max_bc_run = 0
@@ -441,8 +441,7 @@ def evaluate_cola(
                 for a in ARMS:
                     step = chunks[a][k].copy()
                     if velocity_actions:
-                        # Velocity actions are deltas: add them to the current
-                        # joint positions, read fresh each step.
+                        # Velocity actions are deltas on the current joint positions.
                         step[:6] = data.qpos[scene['arms'][a]['qadr']] + step[:6]
                     apply_action(data, scene['arms'][a], step)
 
@@ -480,7 +479,8 @@ def evaluate_cola(
 
                 elif not bc_done:
                     # Link 2: B -> C
-                    # The drop test keys on contact: B may dip below LIFT_Z while turning.
+                    # Drops are detected by contact, since B can dip below LIFT_Z
+                    # while turning.
                     if not holds['b'] and not holds['c']:
                         no_contact_run += 1
                         if no_contact_run >= DROP_STEPS:
@@ -602,8 +602,8 @@ def evaluate_cola(
     if results['skipped']:
         print(f"  Skipped starts:   {results['skipped']} (grasp lost at reset, not scored)")
     print(f"Mean control steps: {s['mean_control_steps']:.1f}")
-    # If these approach max_control_steps, raise --max-control-steps before
-    # reading failures as policy failures.
+    # If these are close to max_control_steps, episodes are timing out; try a
+    # larger --max-control-steps.
     if s['mean_ab_step'] is not None:
         print(f"Mean A->B step:     {s['mean_ab_step']:.1f} / {max_control_steps}")
     if s['mean_bc_step'] is not None:

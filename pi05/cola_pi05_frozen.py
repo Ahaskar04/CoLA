@@ -51,7 +51,7 @@ class MessageDecoder(nn.Module):
 
 
 class ProprioEncoder(nn.Module):
-    """Embed the 7-d joint state so it isn't swamped by 2048 vision dims."""
+    """Embed the 7-d joint state before it joins the 2048-d vision features."""
     proprio_dim: int = PROPRIO_DIM
 
     @nn.compact
@@ -191,7 +191,7 @@ class ConditionalUnet1D(nn.Module):
         x = ConditionalResidualBlock1D(mid, self.kernel_size, self.n_groups)(x, cond)
 
         for dim, skip in zip(reversed(self.down_dims), reversed(skips)):
-            # Upsample, then trim to the skip's length (odd lengths don't double back).
+            # Upsample and trim to the skip's length (odd lengths don't round-trip).
             x = jnp.repeat(x, 2, axis=1)[:, :skip.shape[1]]
             x = jnp.concatenate([x, skip], axis=-1)
             x = ConditionalResidualBlock1D(dim, self.kernel_size, self.n_groups)(x, cond)
@@ -200,7 +200,7 @@ class ConditionalUnet1D(nn.Module):
         n_joint = self.action_dim - 1
         eps = nn.Conv(n_joint, kernel_size=(1,))(x)
 
-        # The binary gripper is predicted directly, outside the diffusion.
+        # The gripper is predicted directly (not diffused).
         g = nn.Dense(128)(combined_features)
         g = mish(g)
         g = nn.Dense(self.chunk_size)(g).reshape(-1, self.chunk_size, 1)
@@ -210,8 +210,8 @@ class ConditionalUnet1D(nn.Module):
 class DiffusionHead(nn.Module):
     """Residual-MLP denoiser over the joint columns of an action chunk.
 
-    Diffusion keeps multimodal actions apart where an L1 head would average
-    them. The binary gripper is not diffused; it gets a separate logit.
+    Diffusion can represent multimodal actions, which an L1 head averages.
+    The gripper is not diffused and gets its own logit.
     """
     action_dim: int = ACTION_DIM
     chunk_size: int = CHUNK_SIZE
@@ -233,7 +233,7 @@ class DiffusionHead(nn.Module):
 
         x = nn.Dense(self.hidden)(x)
         x = nn.relu(x)
-        # Residual blocks: a plain deep MLP trains poorly as a denoiser.
+        # Residual blocks (a plain deep MLP trained poorly as a denoiser).
         for _ in range(self.n_layers):
             h = nn.Dense(self.hidden)(x)
             h = nn.relu(h)
@@ -244,7 +244,7 @@ class DiffusionHead(nn.Module):
         eps = nn.Dense(self.chunk_size * n_joint)(x)
         eps = eps.reshape(b, self.chunk_size, n_joint)
 
-        # Gripper logits come straight from the features, not the diffusion.
+        # Gripper logits straight from the features (no diffusion).
         g = nn.Dense(128)(combined_features)
         g = nn.relu(g)
         g = nn.Dense(self.chunk_size)(g).reshape(b, self.chunk_size, 1)
@@ -263,6 +263,7 @@ class COLAModel:
         use_diffusion: bool = False,
         diffusion_unet: bool = False,
         unet_dims: tuple = None,
+        seed: int = 0,
     ):
         """
         use_proprio:    add each arm's own joint state to its features.
@@ -271,6 +272,7 @@ class COLAModel:
         use_diffusion:  diffusion head for the joints; the gripper stays a logit.
         diffusion_unet: 1D U-Net denoiser instead of the residual MLP.
         unet_dims:      U-Net channel widths per level; None keeps (128, 256).
+        seed:           seed for the adapters' initial weights.
         """
         # No backbone: features are pre-extracted (training) or computed by
         # the evaluator's policy (rollout).
@@ -281,7 +283,7 @@ class COLAModel:
         if use_diffusion:
             # Precomputed noise schedule.
             self.alpha_bars = cosine_alpha_bars(DIFFUSION_STEPS)
-            # Advanced on every call so each control step samples fresh noise.
+            # Split on every call, so each control step gets new noise.
             self._sample_rng = jax.random.PRNGKey(0)
 
         # Adapters
@@ -303,12 +305,12 @@ class COLAModel:
             self.action_head_a = CoordinationHead(action_dim=ACTION_DIM, split_gripper=split_gripper)
             self.action_head_b = CoordinationHead(action_dim=ACTION_DIM, split_gripper=split_gripper)
 
-        rng = jax.random.PRNGKey(0)
+        rng = jax.random.PRNGKey(seed)
         dummy_message = jnp.ones((1, MESSAGE_DIM))
 
-        # Each arm's self-representation: its features, plus the overhead
-        # features and its embedded state when enabled. It feeds both the
-        # message encoder and the action head.
+        # Self-representation: own features, plus the overhead features and the
+        # embedded state if enabled. Input to both the message encoder and the
+        # action head.
         self_dim = (FEATURE_DIM
                     + (FEATURE_DIM if use_overhead else 0)
                     + (PROPRIO_DIM if use_proprio else 0))
@@ -448,8 +450,8 @@ class COLAModel:
         combined_b = jnp.concatenate([self_b, decoded_a], axis=-1)
 
         if self.use_diffusion:
-            # Diffusion: return the conditioning vectors; the trainer and the
-            # sampler drive the head themselves.
+            # With diffusion, return the conditioning vectors; the trainer and the
+            # sampler call the head themselves.
             return combined_a, combined_b
 
         action_a = self.action_head_a.apply(params['action_head_a'], combined_a)

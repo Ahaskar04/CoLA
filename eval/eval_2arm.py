@@ -246,7 +246,7 @@ def reset_episode_handover(scene, seed: int, scene_xml: str):
     if not check_gripper_box_contact(m, d):
         return False
 
-    # Copy the constructed state into the scene the policy actually runs in.
+    # Copy the start state into the scene used for the rollout.
     scene['data'].qpos[:] = d.qpos
     scene['data'].qvel[:] = 0.0
     scene['data'].ctrl[:] = d.ctrl
@@ -320,7 +320,7 @@ def evaluate_cola(
     use_overhead = bool(ckpt.get('use_overhead', False))
     use_wrist = bool(ckpt.get('use_wrist', ckpt.get('config', {}).get('use_wrist', True)))
     split_gripper = bool(ckpt.get('split_gripper', False))
-    # Diffusion checkpoints need a different head, so the flag comes from the checkpoint.
+    # Read the head type from the checkpoint.
     use_diffusion = bool(ckpt.get('config', {}).get('use_diffusion', False))
     # Velocity caches (prepare_cache_2arm.py --velocity) store deltas, not targets.
     with open(Path(cache_dir) / 'action_stats.json') as _f:
@@ -424,7 +424,7 @@ def evaluate_cola(
         success = False
         control_step = 0
 
-        # Cheap diagnostics — make a failure attributable without a re-run.
+        # Extra diagnostics, to tell failure modes apart.
         max_box_z = 0.0
         max_handover_run = 0
         best_home_err = float('inf')   # smallest post-transfer home error seen
@@ -468,20 +468,19 @@ def evaluate_cola(
                 chunk_a = denormalise(chunk_a, 'action_a')
                 chunk_b = denormalise(chunk_b, 'action_b')
 
-            # Execute only what was predicted; a shorter head means re-querying sooner.
+            # Run at most CHUNK_SIZE steps, fewer if the policy predicted fewer.
             n_exec = min(len(chunk_a), len(chunk_b), CHUNK_SIZE)
             for k in range(n_exec):
                 if control_step >= max_control_steps:
                     break
 
                 if velocity_actions:
-                    # Velocity actions are deltas: add them to the current
-                    # joint positions, read fresh each step.
+                    # Velocity actions are deltas on the current joint positions.
                     step_a = chunk_a[k].copy()
                     step_b = chunk_b[k].copy()
                     step_a[:6] = data.qpos[scene['a']['qadr']] + step_a[:6]
                     step_b[:6] = data.qpos[scene['b']['qadr']] + step_b[:6]
-                    # Column 6 is the gripper and was never differenced.
+                    # Column 6 (gripper) is absolute, not a delta.
                     apply_action(data, scene['a'], step_a)
                     apply_action(data, scene['b'], step_b)
                 else:
@@ -507,7 +506,7 @@ def evaluate_cola(
                     min_a_box_dist,
                     float(np.linalg.norm(data.site(scene['a']['site']).xpos - box_pos)))
 
-                # A has genuinely let go, not merely lost contact for a frame.
+                # A's gripper must be open too (contact alone can flicker).
                 a_open = (float(data.qpos[scene['a']['finger_qadr']])
                           > GRIPPER_OPEN * GRIPPER_OPEN_FRAC)
                 b_has_box = b_holds and box_z > LIFT_Z
@@ -526,8 +525,9 @@ def evaluate_cola(
                         if criterion == 'transfer':
                             success = True
                 else:
-                    # Phase 2: keep it (and optionally go home). The drop test
-                    # keys on contact: B may carry the box low on the way back.
+                    # Phase 2: hold the box (and optionally go home). Drops are
+                    # detected by contact, since B may carry the box low on the
+                    # way back.
                     no_contact_run = 0 if b_holds else no_contact_run + 1
                     if no_contact_run >= DROP_STEPS:
                         dropped = True
@@ -605,16 +605,16 @@ def evaluate_cola(
 
     results['summary'] = {
         'n_episodes': n_episodes,
-        # Episodes played: those whose start-state grasp failed are not scored.
+        # Scored episodes (skipped ones excluded).
         'n_scored': scored,
         'success_rate': 100.0 * results['task_successes'] / denom,
         # Phase 1 only.
         'transfer_rate': 100.0 * results['transfer_count'] / denom,
         'drop_rate': 100.0 * results['drop_count'] / denom,
-        # Of the episodes that transferred, how many then lost the box.
+        # Drops among the episodes that transferred.
         'drop_given_transfer': (100.0 * results['drop_count'] / len(transferred)
                                 if transferred else None),
-        # Pick-up (the zero-shot Octo headline).
+        # Pick-up rates (the main zero-shot Octo numbers).
         'a_lift_rate': 100.0 * results['a_lifted_count'] / denom,
         'a_touch_rate': 100.0 * results['a_touched_count'] / denom,
         'b_touch_rate': 100.0 * results['b_touched_count'] / denom,
@@ -643,8 +643,8 @@ def evaluate_cola(
     if s['mean_control_steps'] is not None:
         print(f"Mean control steps: {s['mean_control_steps']:.1f}")
     if s['mean_transfer_step'] is not None:
-        # If this approaches max_control_steps, raise --max-control-steps before
-        # reading failures as policy failures.
+        # If this is close to max_control_steps, episodes are timing out; try a
+        # larger --max-control-steps.
         print(f"Mean transfer step: {s['mean_transfer_step']:.1f} / {max_control_steps}")
 
     out_path = Path(results_path)

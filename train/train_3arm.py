@@ -250,7 +250,7 @@ def gripper_transition_weights(target_chunk, extra_weight, prev_label=None):
         d = jnp.abs(jnp.diff(jnp.concatenate([prev, g], axis=1), axis=1))
         flip = d                                                    # (B, chunk)
 
-    # Widen by one step either side, so timing is supervised, not just the frame.
+    # Widen by one step on each side of the flip.
     pad = jnp.pad(flip, ((0, 0), (1, 1)))
     widened = jnp.maximum(jnp.maximum(pad[:, :-2], pad[:, 1:-1]), pad[:, 2:])
     return 1.0 + extra_weight * widened
@@ -272,7 +272,7 @@ def make_loss_fn(model, cfg):
         ab = model.alpha_bars
         total = 0.0
         parts = {}
-        # Validation passes rng=None; a fixed key keeps val loss comparable.
+        # Validation passes rng=None and uses a fixed key, so val losses compare.
         base = rng if rng is not None else jax.random.PRNGKey(0)
 
         for tag in ARMS:
@@ -310,7 +310,8 @@ def make_loss_fn(model, cfg):
     def compute_loss(params, batch, rng=None):
         state = {a: batch['state'][a] for a in ARMS} if use_proprio else {}
 
-        # Proprio dropout (training only, per arm), so the policy can't ignore vision.
+        # Proprio dropout during training (per arm), so the policy has to
+        # use vision too.
         if use_proprio and rng is not None and p_drop > 0:
             keys = jax.random.split(rng, N_ARMS)
             for i, a in enumerate(ARMS):
@@ -321,8 +322,7 @@ def make_loss_fn(model, cfg):
             batch['features'], params=params,
             proprio=state if use_proprio else None,
             features_o=batch.get('features_o'),
-            # False zeros all six message channels; the parameter count is
-            # unchanged (no-message ablation).
+            # No-message ablation: all six messages are zeroed, the parameters stay.
             use_messages=use_messages,
         )
 
@@ -423,7 +423,7 @@ class EEMetric:
 
     def _ee(self, q):
         self.mujoco.mj_resetDataKeyframe(self.model, self.data, self.key)
-        # Deltas are applied from the home pose, the one reference both share.
+        # Integrate deltas from the home pose, for prediction and target alike.
         self.data.qpos[self.qadr] = (self.home_q + q) if self.velocity else q
         self.mujoco.mj_forward(self.model, self.data)
         return self.data.site(self.site).xpos.copy()
@@ -470,7 +470,7 @@ def train_epoch(train_step, params, opt_state, dataset, rng, batch_size,
                  leave=False)):
         params, opt_state, rng, loss, parts = train_step(params, opt_state, batch, rng)
 
-        # Device-side accumulation: no host sync until the epoch ends.
+        # Accumulate on device; sync with the host once per epoch.
         acc = {'loss': loss, **parts}
         sums = acc if sums is None else jax.tree_util.tree_map(jnp.add, sums, acc)
 
@@ -604,6 +604,7 @@ def train_cola(
         split_gripper=True,
         use_diffusion=use_diffusion,
         diffusion_unet=diffusion_unet,
+        seed=seed,
     )
     params = model.params
 
@@ -635,7 +636,7 @@ def train_cola(
         except Exception as e:
             logger.info(f'  EE metric unavailable ({e}); continuing without it')
 
-    # Gripper class prior: the baseline for gripper accuracy.
+    # Gripper class prior, the chance level for gripper accuracy.
     grip_train = np.asarray(jax.device_get(train_ds.act['a'][:, GRIPPER_IDX]))
     prior = float((grip_train > 0).mean())
     logger.info(f'\n  gripper prior (arm a, fraction open): {prior:.4f}')
@@ -677,8 +678,7 @@ def train_cola(
             with open(Path(checkpoint_dir) / 'best_model.pkl', 'wb') as f:
                 pickle.dump({'params': jax.device_get(params),
                              'config': cfg,
-                             # Top level, so the evaluator can refuse a
-                             # mismatched message setting.
+                             # Checked by the evaluator against --no-messages.
                              'use_messages': use_messages,
                              'use_overhead': use_overhead,
                              'use_wrist': use_wrist,

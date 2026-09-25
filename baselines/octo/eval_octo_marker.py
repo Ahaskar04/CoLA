@@ -1,9 +1,9 @@
-"""Octo baseline on the hidden-marker handover, scored by CoLA's own harness.
+"""Octo baseline on the hidden-marker handover.
 
-Only policy loading and the forward pass differ from eval/eval_marker.py.
-Reset, success criterion and summary are CoLA's code, and check_criterion()
-refuses to run if they have drifted. Runs two independent per-arm policies (no
-channel), or one centralised policy with --centralised.
+Reset, success criterion and summary are copied from eval/eval_marker.py; only
+policy loading and the forward pass differ. check_criterion() exits if the
+copies no longer match. Runs two independent per-arm policies (no channel), or
+one centralised policy with --centralised.
 
 Shard with --seed-offset; pool shards with --merge.
 """
@@ -36,7 +36,7 @@ from eval_octo_2arm import (                               # noqa: E402
 
 COLA_SOURCE = str(REPO / 'eval' / 'eval_marker.py')
 RESULTS_DIR = REPO / 'results' / 'octo_marker'
-# Markers are assembled so this file's own copies of them do not match first.
+# Built from pieces so the search doesn't match these lines themselves.
 _SCORE_START = ' ' * 12 + 'for k in range(' + 'CHUNK_SIZE):'
 _SCORE_END = ' ' * 4 + 'renderer.' + 'close()'
 _SUM_START = ' ' * 4 + "eps = results[" + "'episodes']"
@@ -49,7 +49,7 @@ def _block(text, start, end):
 
 
 def check_criterion():
-    """Refuse to run if the scoring or summary code no longer matches CoLA's."""
+    """Exit if the scoring or summary code differs from CoLA's."""
     cola = Path(COLA_SOURCE).read_text()
     mine = Path(__file__).read_text()
     for name, s, e in (('scoring loop', _SCORE_START, _SCORE_END),
@@ -61,7 +61,7 @@ def check_criterion():
 
 
 def merge(shards, results_path):
-    """Pool sharded runs and rerun the summary over all their episodes."""
+    """Merge sharded runs and recompute the summary."""
     # Keep each shard with its own path, sorted by seed offset.
     parts = sorted(((p, json.load(open(p))) for p in shards),
                    key=lambda pr: pr[1]['seed_offset'])
@@ -101,8 +101,8 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
         videos_dir.mkdir(parents=True, exist_ok=True)
 
     if centralised:
-        # One 14-d policy drives both arms: act() slices its output by
-        # arm['prefix'], so the same object serves as policy_a and policy_b.
+        # One 14-d policy for both arms. act() slices its output by arm['prefix'],
+        # so the same object is passed as policy_a and policy_b.
         print('\n1. Loading ONE centralised Octo policy (14-d, drives both arms)...')
         policy_a = policy_b = CentralisedOctoPolicy(
             checkpoint_a, None, None, None, seed + seed_offset, False)
@@ -111,8 +111,8 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
             f'--centralised needs a 14-d checkpoint; this one emits {n_out}')
         assert policy_a.meta.get('arm') == 'both', (
             f"centralised checkpoint has arm={policy_a.meta.get('arm')!r}, expected 'both'")
-        # act() needs arm['prefix'], which build_scene() doesn't store; it is
-        # added below so the CoLA harness itself stays unchanged.
+        # act() needs arm['prefix']. build_scene() doesn't store it, so it is added
+        # here instead of changing the CoLA code.
     else:
         print('\n1. Loading Octo policies (one per arm, no channel)...')
         policy_a = FinetunedOctoPolicy(checkpoint_a, seed=seed + seed_offset)
@@ -244,18 +244,18 @@ def evaluate_octo_marker(checkpoint_a, checkpoint_b, n_episodes=150,
 
 
 def _summarise(results, results_path, save_videos=False, videos_dir=None):
-    """CoLA's summary and printout, verbatim (check_criterion verifies)."""
+    """Summary and printout copied from eval_marker.py (checked by check_criterion)."""
     eps = results['episodes']
     n = len(eps)
     n_correct = sum(e['correct'] for e in eps)
     n_tray = sum(e['landed_tray'] is not None for e in eps)
     n_xfer = sum(e['transfer_done'] for e in eps)
 
-    # Per-colour breakdown: a policy that always picks one tray shows up here.
+    # Per-colour breakdown (catches a policy that always picks the same tray).
     by_color = {}
     for c in MARKER_COLORS:
         sub = [e for e in eps if e['marker_color'] == c]
-        # Conditioned on a completed handover, like the headline.
+        # Only episodes with a completed handover, as in the main metric.
         sub_x = [e for e in sub if e['transfer_done']]
         by_color[c] = {
             'n': len(sub),
@@ -266,14 +266,12 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
                       for t in MARKER_COLORS + [None]},
         }
 
-    # Headline: correct tray among completed handovers, which separates
-    # routing (communication) from manipulation.
+    # Main metric: correct tray out of the episodes where the handover happened.
     n_correct_xfer = sum(e['correct'] for e in eps if e['transfer_done'])
     correct_given_xfer = (100.0 * n_correct_xfer / n_xfer) if n_xfer else None
 
     results['summary'] = {
         'n_episodes': n,
-        # Headline metric.
         'correct_given_transfer': correct_given_xfer,
         'n_transfers': n_xfer,
         'n_correct_given_transfer': n_correct_xfer,
@@ -290,7 +288,7 @@ def _summarise(results, results_path, save_videos=False, videos_dir=None):
     print('\n' + '=' * 64)
     print('RESULTS')
     print('=' * 64)
-    # Headline: routing skill with manipulation factored out.
+    # Main metric.
     if correct_given_xfer is not None:
         print(f"CORRECT | HANDOVER: {n_correct_xfer}/{n_xfer} = "
               f"{correct_given_xfer:.1f}%   (chance {s['chance_rate']:.1f}%)")

@@ -67,7 +67,7 @@ def main():
         else:
             states_a, states_b, lens = load_states(paths)
 
-        # Guard the alignment that everything downstream assumes.
+        # Check that the rows line up.
         n_actions = len(np.load(args.cache_dir / f'{split}_actions_a.npy', mmap_mode='r'))
         assert len(states_a) == n_actions, \
             f'{split}: {len(states_a)} states vs {n_actions} actions — manifest order changed'

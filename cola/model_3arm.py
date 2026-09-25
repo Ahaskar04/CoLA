@@ -67,7 +67,7 @@ class MessageDecoder(nn.Module):
 
 
 class ProprioEncoder(nn.Module):
-    """Embed the 7-d joint state so it isn't swamped by 768 vision dims."""
+    """Embed the 7-d joint state before it joins the 768-d vision features."""
     proprio_dim: int = PROPRIO_DIM
 
     @nn.compact
@@ -209,7 +209,7 @@ class ConditionalUnet1D(nn.Module):
         x = ConditionalResidualBlock1D(mid, self.kernel_size, self.n_groups)(x, cond_g)
 
         for dim, skip in zip(reversed(self.down_dims), reversed(skips)):
-            # Upsample, then trim to the skip's length (odd lengths don't double back).
+            # Upsample and trim to the skip's length (odd lengths don't round-trip).
             x = jnp.repeat(x, 2, axis=1)[:, :skip.shape[1]]
             x = jnp.concatenate([x, skip], axis=-1)
             x = ConditionalResidualBlock1D(dim, self.kernel_size, self.n_groups)(x, cond_g)
@@ -218,7 +218,7 @@ class ConditionalUnet1D(nn.Module):
         n_joint = self.action_dim - 1
         eps = nn.Conv(n_joint, kernel_size=(1,))(x)
 
-        # The binary gripper is predicted directly, outside the diffusion.
+        # The gripper is predicted directly (not diffused).
         g = nn.Dense(128)(cond)
         g = mish(g)
         g = nn.Dense(self.chunk_size)(g).reshape(-1, self.chunk_size, 1)
@@ -282,6 +282,7 @@ class COLAModel3Arm:
         split_gripper: bool = False,
         use_diffusion: bool = False,
         diffusion_unet: bool = False,
+        seed: int = 0,
     ):
         """
         use_proprio:    add each arm's own joint state to its features.
@@ -291,6 +292,7 @@ class COLAModel3Arm:
         split_gripper:  emit the gripper as a BCE logit (see CoordinationHead).
         use_diffusion:  diffusion head for the joints; the gripper stays a logit.
         diffusion_unet: 1D U-Net denoiser instead of the flat residual MLP.
+        seed:           seed for the adapters' initial weights.
         """
         print("Loading Octo backbone...")
         self.octo = OctoModel.load_pretrained(octo_checkpoint)
@@ -311,7 +313,7 @@ class COLAModel3Arm:
         if use_diffusion:
             # Precomputed noise schedule.
             self.alpha_bars = cosine_alpha_bars(DIFFUSION_STEPS)
-            # Advanced on every forward() so each control step samples fresh noise.
+            # Split on every forward(), so each control step gets new noise.
             self._sample_rng = jax.random.PRNGKey(0)
 
         # Adapters: one per arm, and one decoder per ordered pair.
@@ -330,11 +332,11 @@ class COLAModel3Arm:
                 for a in ARMS
             }
 
-        rng = jax.random.PRNGKey(0)
+        rng = jax.random.PRNGKey(seed)
         dummy_message = jnp.ones((1, MESSAGE_DIM))
 
-        # Each arm's self-representation: its wrist and/or the overhead
-        # features, plus its embedded state when enabled.
+        # Self-representation: wrist and/or overhead features, plus the embedded
+        # state if enabled.
         self_dim = ((FEATURE_DIM if use_wrist else 0)
                     + (FEATURE_DIM if use_overhead else 0)
                     + (PROPRIO_DIM if use_proprio else 0))
@@ -498,8 +500,7 @@ class COLAModel3Arm:
         combined = self._combine(selves, params, use_messages)
 
         if self.use_diffusion:
-            # Sample a chunk per arm. The RNG advances every call so control
-            # steps don't reuse the same noise.
+            # Sample a chunk per arm, with new noise every call.
             keys = jax.random.split(self._sample_rng, N_ARMS + 1)
             self._sample_rng = keys[0]
             return {

@@ -1,9 +1,9 @@
-"""Octo baseline on the three-arm A -> B -> C handover, scored by CoLA's harness.
+"""Octo baseline on the three-arm A -> B -> C handover.
 
-Only policy loading and the forward pass differ from eval/eval_3arm.py.
-Reset, criterion, drop detection and summary are CoLA's code, and
-check_criterion() refuses to run if they have drifted. Runs three independent
-per-arm policies (overhead camera + own proprio) with no channel.
+Reset, criterion, drop detection and summary are copied from eval/eval_3arm.py;
+only policy loading and the forward pass differ. check_criterion() exits if
+the copies no longer match. Runs three independent per-arm policies (overhead
+camera + own proprio) with no channel.
 """
 
 import argparse
@@ -34,7 +34,7 @@ COLA_SOURCE = str(REPO / 'eval' / 'eval_3arm.py')
 RESULTS_DIR = REPO / 'results' / 'octo_3arm'
 
 
-# Markers are assembled so this file's own copies of them do not match first.
+# Built from pieces so the search doesn't match these lines themselves.
 _START = ' ' * 12 + 'for k in range(' + 'CHUNK_SIZE):'
 _END = ' ' * 4 + 'renderer.' + 'close()\n\n' + ' ' * 4 + "scored = len(results['episodes'])"
 
@@ -46,7 +46,7 @@ def _criterion_block(text):
 
 
 def check_criterion():
-    """Refuse to run if the scoring code no longer matches CoLA's."""
+    """Exit if the scoring code differs from CoLA's."""
     mine = _criterion_block(open(__file__).read())
     theirs = _criterion_block(open(COLA_SOURCE).read())
     if mine != theirs:
@@ -94,7 +94,7 @@ def evaluate_octo_3arm(
         videos_dir.mkdir(parents=True, exist_ok=True)
 
     print('\n1. Loading Octo policies (one per arm, no channel)...')
-    # Octo learned whatever the cache holds: absolute targets unless it says velocity.
+    # Octo was trained on whatever the cache holds (absolute unless it says velocity).
     with open(Path(cache_dir) / 'action_stats.json') as _f:
         velocity_actions = bool(json.load(_f).get('velocity', False))
     if velocity_actions:
@@ -159,7 +159,7 @@ def evaluate_octo_3arm(
         success = False
         control_step = 0
 
-        # Cheap diagnostics -- make a failure attributable without a re-run.
+        # Extra diagnostics, to tell failure modes apart.
         max_box_z = 0.0
         max_ab_run = 0
         max_bc_run = 0
@@ -177,8 +177,7 @@ def evaluate_octo_3arm(
                 for a in ARMS:
                     step = chunks[a][k].copy()
                     if velocity_actions:
-                        # Velocity actions are deltas: add them to the current
-                        # joint positions, read fresh each step.
+                        # Velocity actions are deltas on the current joint positions.
                         step[:6] = data.qpos[scene['arms'][a]['qadr']] + step[:6]
                     apply_action(data, scene['arms'][a], step)
 
@@ -216,7 +215,8 @@ def evaluate_octo_3arm(
 
                 elif not bc_done:
                     # Link 2: B -> C
-                    # The drop test keys on contact: B may dip below LIFT_Z while turning.
+                    # Drops are detected by contact, since B can dip below LIFT_Z
+                    # while turning.
                     if not holds['b'] and not holds['c']:
                         no_contact_run += 1
                         if no_contact_run >= DROP_STEPS:
@@ -338,8 +338,8 @@ def evaluate_octo_3arm(
     if results['skipped']:
         print(f"  Skipped starts:   {results['skipped']} (grasp lost at reset, not scored)")
     print(f"Mean control steps: {s['mean_control_steps']:.1f}")
-    # If these approach max_control_steps, raise --max-control-steps before
-    # reading failures as policy failures.
+    # If these are close to max_control_steps, episodes are timing out; try a
+    # larger --max-control-steps.
     if s['mean_ab_step'] is not None:
         print(f"Mean A->B step:     {s['mean_ab_step']:.1f} / {max_control_steps}")
     if s['mean_bc_step'] is not None:

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict
 
 
-CHUNK_SIZE = 10  # must match cola_architecture_3arm.CHUNK_SIZE
+CHUNK_SIZE = 10  # must match cola.model_3arm.CHUNK_SIZE
 ARMS = ('a', 'b', 'c')
 
 

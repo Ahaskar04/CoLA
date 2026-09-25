@@ -51,7 +51,7 @@ while kept < NUM_EPISODES and attempts < MAX_ATTEMPTS:
     _kw = {"handover_only": True} if HANDOVER_ONLY else {}
     result = run_episode(setup, box_x_range, box_y_range, **_kw)
 
-    # The randomised reset shook the box loose; nothing was recorded, so retry.
+    # Box dropped during the reset; nothing recorded, so retry.
     if result[0] is None:
         grasp_rejects += 1
         print(f"  DISCARDED: grasp lost during reset ({grasp_rejects} so far)")
@@ -59,7 +59,7 @@ while kept < NUM_EPISODES and attempts < MAX_ATTEMPTS:
 
     episode_data, success, review_frames = result
 
-    # Failed episodes are kept: their labels are still valid.
+    # Failed episodes are kept too; their action labels are still valid.
     if success:
         successes += 1
 

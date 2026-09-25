@@ -28,7 +28,7 @@ import optax
 import flax
 import tqdm
 
-try:                                   # keep TF off the GPU if octo drags it in
+try:                                   # keep TF off the GPU (octo imports it)
     import tensorflow as tf
     tf.config.set_visible_devices([], 'GPU')
 except Exception:
@@ -124,7 +124,7 @@ def main():
                         'walltime cap when the throughput is not known.')
     args = p.parse_args()
 
-    # A chained segment queued after the run already finished: nothing to do.
+    # Run already finished (e.g. a chained job queued after it); nothing to do.
     _sd = Path(args.save_dir)
     if (args.resume and (_sd / str(args.steps - 1)).is_dir()
             and not (_sd / 'resume_state.npz').exists()):
@@ -268,7 +268,7 @@ def main():
         # MultiSteps applies one optimiser step every k micro-steps.
         tx = optax.MultiSteps(tx, every_k_schedule=args.grad_accum)
 
-    # Report what is actually trainable.
+    # Print the trainable parameter count.
     from fnmatch import fnmatch
     import flax
     n_all = n_train = 0
