@@ -79,7 +79,7 @@ class FinetunedOctoPolicy:
         self.joint_step = []
 
         print(f'   wrist camera: {self.wrist_camera or "(none)"}')
-        print(f'   arm {meta.get("arm","?")} | camera {camera} | '
+        print(f'   arm {meta.get("arm","?")} | camera {self.camera} | '
               f'window {self.window} | horizon {self.horizon} '
               f'(executing {self.exec_steps}'
               f'{" -- SHORTER than CoLA cadence " + str(E.CHUNK_SIZE) if self.exec_steps < E.CHUNK_SIZE else ""})')
