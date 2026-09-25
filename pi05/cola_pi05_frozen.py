@@ -285,6 +285,10 @@ class COLAModel:
             self.alpha_bars = cosine_alpha_bars(DIFFUSION_STEPS)
             # Split on every call, so each control step gets new noise.
             self._sample_rng = jax.random.PRNGKey(0)
+            # Compiled once per arm. Run op by op, the sampler took ~3.5 s per
+            # query and dominated evaluation time.
+            self.sample_actions = jax.jit(self._sample_actions,
+                                          static_argnames=('arm', 'n_steps'))
 
         # Adapters
         self.encoder_a = MessageEncoder(message_dim=MESSAGE_DIM)
@@ -376,7 +380,7 @@ class COLAModel:
     def forward(self, *args, **kwargs):
         raise NotImplementedError("use forward_from_features(); see extract_octo_features")
 
-    def sample_actions(self, combined, params, arm: str, rng, n_steps: int = None):
+    def _sample_actions(self, combined, params, arm: str, rng, n_steps: int = None):
         """DDIM sampling (eta=0): noise -> action chunk in n_steps passes.
 
         Returns (B, chunk, ACTION_DIM): denoised joints with the gripper logit

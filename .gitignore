@@ -13,3 +13,5 @@ __pycache__/
 
 # envs/assets (meshes and textures shared by the three tasks) is tracked on
 # purpose: the scene XMLs load it.
+
+/analysis
