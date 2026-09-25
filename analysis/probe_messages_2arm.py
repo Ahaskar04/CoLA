@@ -21,7 +21,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from probe_messages_marker import build_messages, load_split, normalise_states  # noqa: E402
+from probe_messages_marker import build_messages, load_split  # noqa: E402
 
 CACHE = str(REPO / "data" / "cache" / "handover_2arm")
 FEATS = str(REPO / "data" / "features" / "handover_2arm")
@@ -91,7 +91,7 @@ def main():
             raise SystemExit(f"{split}: {len(o)} episodes but {len(lens)} lens")
         fo = pathlib.Path(a.feat_dir) / f"{split}_features_o.npy"
         feats.append(f)
-        states.append(normalise_states(a.cache_dir, st))
+        states.append(st)
         feat_o.append(np.load(fo) if fo.exists() else None)
         # Offset episode ids so a group never spans two splits.
         eps.append(ep_idx + off_base)

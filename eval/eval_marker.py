@@ -315,10 +315,8 @@ def evaluate(model_path, n_episodes=150, scene_xml=SCENE_XML,
         swap = {'bank': bank, 'rng': np.random.default_rng(swap_seed)}
         print(f'\n   MESSAGE SWAP: B receives a donor msg_a from a DIFFERENT '
               f'colour ({ {c: len(v) for c, v in bank.items()} } donors)')
-        print('   Tests positive LISTENING: the probe already shows the colour '
-              'is readable in msg_a (73.3% vs a 33.3% control), but readable is '
-              'not used. If B follows the SWAPPED colour, the channel causally '
-              'drives the tray choice.')
+        print('   If B lands in the donor colour\'s tray, the message drives '
+              'the tray choice.')
 
     print(f'\n3. Running {n_episodes} episodes...')
     for ep in tqdm(range(n_episodes), desc='Evaluating'):

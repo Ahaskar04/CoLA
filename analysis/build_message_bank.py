@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from probe_messages_marker import (                             # noqa: E402
     CACHE, COLORS, FEATS, MSG_CKPT, build_messages, episode_colors,
-    load_split, normalise_states)
+    load_split)
 
 
 def main():
@@ -44,7 +44,7 @@ def main():
                              f"{len(lens)} in episode_lens")
         fo = pathlib.Path(a.feat_dir) / f"{split}_features_o.npy"
         _, msg, meta = build_messages(
-            a.ckpt, feat, normalise_states(a.cache_dir, state),
+            a.ckpt, feat, state,
             np.load(fo) if fo.exists() else None)
 
         # Split the flat (frames, d_m) array back into per-episode trajectories.

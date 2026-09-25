@@ -43,7 +43,11 @@ def episode_colors(cache_dir, split):
 
 
 def load_split(cache_dir, feat_dir, split):
-    """Per-frame features and states, plus the episode index of each frame."""
+    """Per-frame features and states, plus the episode index of each frame.
+
+    The cached states are already z-scored (prepare_states_2arm.py) and go to the
+    encoder as they are, as in training.
+    """
     lens = np.load(pathlib.Path(cache_dir) / f"{split}_episode_lens.npy")
     feat = np.load(pathlib.Path(feat_dir) / f"{split}_features_a.npy")
     state = np.load(pathlib.Path(cache_dir) / f"{split}_states_a.npy")
@@ -53,15 +57,6 @@ def load_split(cache_dir, feat_dir, split):
             f"{lens.sum()} -- cache and features are from different runs")
     ep_idx = np.repeat(np.arange(len(lens)), lens)
     return feat, state, ep_idx, lens
-
-
-def normalise_states(cache_dir, states):
-    """Same normalisation the trainer applied; the encoder expects it."""
-    stats = json.load(open(pathlib.Path(cache_dir) / "state_stats.json"))
-    s = stats["state_a"] if "state_a" in stats else stats["a"]
-    mean = np.asarray(s["mean"], dtype=np.float32)
-    std = np.asarray(s["std"], dtype=np.float32)
-    return (states - mean) / np.maximum(std, 1e-6)
 
 
 _MODEL_CACHE = {}
@@ -208,7 +203,7 @@ def main():
         y = np.asarray([COLORS.index(cols[e]) for e in ep_idx])
         fo = pathlib.Path(a.feat_dir) / f"{split}_features_o.npy"
         splits[split] = {
-            "feat": feat, "state_n": normalise_states(a.cache_dir, state),
+            "feat": feat, "state_n": state,
             "feat_o": np.load(fo) if fo.exists() else None,
             "y": y, "ep": ep_idx, "n_ep": len(lens),
         }
@@ -228,7 +223,7 @@ def main():
                 cols = episode_colors(a.cache_dir, split)
                 fo = pathlib.Path(a.feat_dir) / f"{split}_features_o.npy"
                 splits[split] = {
-                    "feat": feat, "state_n": normalise_states(a.cache_dir, state),
+                    "feat": feat, "state_n": state,
                     "feat_o": np.load(fo) if fo.exists() else None,
                     "y": np.asarray([COLORS.index(cols[e]) for e in ep_idx]),
                     "ep": ep_idx, "n_ep": len(lens),
